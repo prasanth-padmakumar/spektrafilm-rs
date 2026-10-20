@@ -107,15 +107,6 @@ pub fn compute_exposure_correction(
                 }
             }
         });
-    tracing::info!(
-        matrix = ?couplers_matrix,
-        donor_k = ?donor_k,
-        donor_ref = ?donor_ref,
-        donor_first = ?donor_image.data.get(0..3).map(|px| [px[0] as f64, px[1] as f64, px[2] as f64]),
-        correction_first = ?correction.data.get(0..3).map(|px| [px[0] as f64, px[1] as f64, px[2] as f64]),
-        "DIR CPU f64 matrix diagnostic"
-    );
-
     if diffusion_size_pixel > 0.0 {
         // Python: `(1 - w) * fast_gaussian_filter(corr, σ_size)
         //         + w * fast_exponential_filter(corr, σ_tail)`.
@@ -191,51 +182,6 @@ pub fn apply_density_correction(
     ];
     let donor_k = [langmuir_donor_k_rgb[0] * density_max[0], langmuir_donor_k_rgb[1] * density_max[1], langmuir_donor_k_rgb[2] * density_max[2]];
     let donor_ref = [density_max[0] * 0.5, density_max[1] * 0.5, density_max[2] * 0.5];
-    let curve_count = norm_curves.len();
-    let curve_min = [
-        norm_curves
-            .iter()
-            .map(|row| row[0])
-            .fold(f64::INFINITY, f64::min),
-        norm_curves
-            .iter()
-            .map(|row| row[1])
-            .fold(f64::INFINITY, f64::min),
-        norm_curves
-            .iter()
-            .map(|row| row[2])
-            .fold(f64::INFINITY, f64::min),
-    ];
-    let sample_indices: Vec<usize> = if curve_count == 0 {
-        Vec::new()
-    } else {
-        [
-            0,
-            curve_count / 4,
-            curve_count / 2,
-            (3 * curve_count) / 4,
-            curve_count - 1,
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
-    };
-    let curve_samples: Vec<[f64; 3]> = sample_indices
-        .iter()
-        .map(|&index| norm_curves[index])
-        .collect();
-    tracing::info!(
-        curve_count,
-        curve_min = ?curve_min,
-        curve_max = ?density_max,
-        curve_sample_indices = ?sample_indices,
-        curve_samples = ?curve_samples,
-        density_max = ?density_max,
-        donor_k = ?donor_k,
-        donor_ref = ?donor_ref,
-        "DIR normalized density curve diagnostics"
-    );
     let density_curves_0 = compute_curves_before_dir(&norm_curves, log_exposure, &matrix_scaled, positive, donor_k, donor_ref);
 
     let diffusion_size_px = (diffusion_size_um / pixel_size_um as f64) as f32;

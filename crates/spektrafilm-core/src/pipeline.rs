@@ -6,142 +6,59 @@
 ///   3. Compute print exposure normalization factor from midgray spectral density
 ///   4. Pass all calibration data to the pipeline stages
 use std::path::Path;
-use std::time::Instant;
 
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::to_f64;
 use spektrafilm_math::spectral::TcLut;
 
-fn log_image_stats(stage: &str, image: &ImageBuf) {
-    if !tracing::enabled!(tracing::Level::INFO) {
-        return;
-    }
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let mut sum = 0.0;
-    let mut channel_sum = [0.0; 3];
-    let mut invalid = 0usize;
-    let mut chroma_sum = 0.0;
-    let mut chroma_max: f64 = 0.0;
-    for (i, value) in image.data.iter().enumerate() {
-        let value = to_f64(*value);
-        if !value.is_finite() {
-            invalid += 1;
-        }
-        min = min.min(value);
-        max = max.max(value);
-        sum += value;
-        channel_sum[i % 3] += value;
-    }
-    for pixel in image.data.chunks_exact(3) {
-        let r = to_f64(pixel[0]);
-        let g = to_f64(pixel[1]);
-        let b = to_f64(pixel[2]);
-        if r.is_finite() && g.is_finite() && b.is_finite() {
-            let chroma = r.max(g).max(b) - r.min(g).min(b);
-            chroma_sum += chroma;
-            chroma_max = chroma_max.max(chroma);
-        }
-    }
-    let n = image.data.len() as f64;
-    let pixels = image.pixel_count() as f64;
-    tracing::info!(
-        stage,
-        width = image.width,
-        height = image.height,
-        min,
-        max,
-        mean = sum / n,
-        channel_mean_r = channel_sum[0] / pixels,
-        channel_mean_g = channel_sum[1] / pixels,
-        channel_mean_b = channel_sum[2] / pixels,
-        invalid,
-        chroma_mean = chroma_sum / pixels,
-        chroma_max,
-        "pipeline image statistics"
-    );
-}
-
-pub(crate) fn log_parity_image_stats(stage: &str, image: &ImageBuf) {
-    if std::env::var_os("SPEKTRAFILM_PARITY_STATS").is_none()
-        || !tracing::enabled!(tracing::Level::INFO)
-        || image.data.is_empty()
-    {
-        return;
-    }
-
-    const MAX_PERCENTILE_SAMPLES: usize = 1_000_000;
-    let sample_step = image.data.len().div_ceil(MAX_PERCENTILE_SAMPLES);
-    let mut percentile_samples = Vec::with_capacity(image.data.len().min(MAX_PERCENTILE_SAMPLES));
-    let mut channel_sum = [0.0; 3];
-    let mut channel_count = [0usize; 3];
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let mut sum = 0.0;
-    let mut count = 0usize;
-    for (i, value) in image.data.iter().enumerate() {
-        let value = to_f64(*value);
-        if !value.is_finite() {
-            continue;
-        }
-        min = min.min(value);
-        max = max.max(value);
-        sum += value;
-        count += 1;
-        channel_sum[i % 3] += value;
-        channel_count[i % 3] += 1;
-        if i % sample_step == 0 {
-            percentile_samples.push(value);
-        }
-    }
-    if percentile_samples.is_empty() {
-        return;
-    }
-    percentile_samples.sort_by(f64::total_cmp);
-
-    let percentile = |q: f64| {
-        let index = q * (percentile_samples.len() - 1) as f64;
-        let lower = index.floor() as usize;
-        let upper = index.ceil() as usize;
-        let fraction = index - lower as f64;
-        percentile_samples[lower] * (1.0 - fraction) + percentile_samples[upper] * fraction
-    };
-    let mean = sum / count as f64;
-    tracing::info!(
-        stage,
-        width = image.width,
-        height = image.height,
-        min,
-        max,
-        mean,
-        median = percentile(0.5),
-        p01 = percentile(0.01),
-        p99 = percentile(0.99),
-        percentile_sample_count = percentile_samples.len(),
-        channel_mean_r = channel_sum[0] / channel_count[0] as f64,
-        channel_mean_g = channel_sum[1] / channel_count[1] as f64,
-        channel_mean_b = channel_sum[2] / channel_count[2] as f64,
-        "parity image statistics"
-    );
-}
-
-fn stage_timings_enabled() -> bool {
-    std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()
-        || std::env::var_os("SPEKTRAFILM_PARITY_STATS").is_some()
-}
-
-fn print_stage_timing(enabled: bool, stage: &str, start: Instant) {
-    if enabled {
-        eprintln!("stage {stage}: {} ms", start.elapsed().as_millis());
-    }
-}
-
 use crate::enlarger;
-use crate::params::RuntimeParams;
+use crate::params::{FilmChemistryParams, PrintCurvesMorphParams, RuntimeParams};
 use crate::profile::Profile;
 use crate::spectral_service;
 use crate::stages;
+
+fn apply_film_curve_chemistry(
+    film: &mut Profile,
+    chemistry: &FilmChemistryParams,
+) -> Result<bool, String> {
+    let Some(model) = film.data.density_curves_model.as_ref() else {
+        return Ok(false);
+    };
+    let morph = PrintCurvesMorphParams {
+        active: chemistry.active,
+        gamma_factor: chemistry.gamma_factor,
+        gamma_factor_fast: chemistry.gamma_factor_fast,
+        gamma_factor_slow: chemistry.gamma_factor_slow,
+        gamma_factor_red: chemistry.gamma_factor_red,
+        gamma_factor_green: chemistry.gamma_factor_green,
+        gamma_factor_blue: chemistry.gamma_factor_blue,
+        developer_exhaustion: chemistry.developer_exhaustion,
+    };
+    let (curves, layers) = crate::print_morph::morph_density_curves_with_layers(
+        &film.log_exposure_f64(),
+        model,
+        &morph,
+        film.is_positive(),
+    )?;
+    let n_layers = model.n_layers();
+    film.data.density_curves = curves
+        .into_iter()
+        .map(|row| row.into_iter().collect())
+        .collect();
+    film.data.density_curves_layers = if n_layers > 1 {
+        layers
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|layer| layer.into_iter().collect())
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(true)
+}
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
     // Monochrome grain is derived from the film, never user-set — clear it
@@ -221,6 +138,8 @@ impl Pipeline {
     pub fn with_params(mut self, params: RuntimeParams) -> Self {
         let mut params = params;
         apply_film_specific_params(&self.film, &mut params);
+        apply_film_curve_chemistry(&mut self.film, &params.film_render.chemistry)
+            .expect("film density-curve model must be evaluable for rendering");
         self.output_gamut = crate::gamut_compression::OutputGamutCompress::build(
             &params.io.output_gamut_compress,
             &params.io.output_color_space,
@@ -236,7 +155,14 @@ impl Pipeline {
         // B&W profiles must be resolved on every construction path —
         // an unresolved family would read development-time columns as
         // R/G/B channels.
-        let film = crate::profile::resolve_for_render(film, params.film_render.development_time);
+        let film_development_time = params
+            .film_render
+            .chemistry
+            .development_time
+            .or(params.film_render.development_time);
+        let mut film = crate::profile::resolve_for_render(film, film_development_time);
+        apply_film_curve_chemistry(&mut film, &params.film_render.chemistry)
+            .expect("film density-curve model must be evaluable for rendering");
         let print = crate::profile::resolve_for_render(print, params.print_render.development_time);
         let print_illuminant = enlarger::enlarger_filtered_illuminant_f64(
             &params.enlarger.illuminant,
@@ -273,7 +199,12 @@ impl Pipeline {
         // B&W profiles: collapse the development-time family to the selected
         // time and broadcast the single channel onto the 3-channel engine
         // layout. Must happen before anything reads the profile data.
-        let film = crate::profile::resolve_for_render(film, params.film_render.development_time);
+        let film_development_time = params
+            .film_render
+            .chemistry
+            .development_time
+            .or(params.film_render.development_time);
+        let mut film = crate::profile::resolve_for_render(film, film_development_time);
         let print = crate::profile::resolve_for_render(print, params.print_render.development_time);
 
         // Python parity: mirror `_apply_film_specifics` in
@@ -283,6 +214,7 @@ impl Pipeline {
         // Python uses. The DIR-coupler gammas in particular differ
         // between positive and negative films.
         apply_film_specific_params(&film, &mut params);
+        apply_film_curve_chemistry(&mut film, &params.film_render.chemistry)?;
 
         // Python parity: look up per-(print, illuminant, film) neutral filter values from
         // the JSON database — matches `apply_database_neutral_print_filters`. Defaults to
@@ -558,28 +490,16 @@ impl Pipeline {
     }
 
     pub fn process(&self, image: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
-        let stage_timings = stage_timings_enabled();
         // Working-resolution rescale (io.upscale_factor) — mirrors Python's
         // ResizingService.crop_and_rescale. Done first so the whole pipeline
         // (and the diffusion-filter kernel size, which scales with the image)
         // runs at the chosen resolution. pixel_size_um is derived per-stage
         // from the image dims, so it follows automatically.
-        let t = Instant::now();
         let image = self.rescale_working(image);
-        log_image_stats("input_rescaled", &image);
-        print_stage_timing(stage_timings, "rescale", t);
-        tracing::info!(
-            backend = backend.name(),
-            run_id = std::env::var("SPEKTRAFILM_RUN_ID").as_deref().unwrap_or("unavailable"),
-            input_sha256 = std::env::var("SPEKTRAFILM_INPUT_SHA256").as_deref().unwrap_or("unavailable"),
-            parameters_sha256 = std::env::var("SPEKTRAFILM_PARAMETERS_SHA256").as_deref().unwrap_or("unavailable"),
-            "pipeline: start"
-        );
 
         // Scanner B&W/slide exposure correction (no-op unless scanner
         // white/black correction is on for a slide or print scan). Computed
         // up front so both the GPU-resident and per-stage paths share it.
-        let t = Instant::now();
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
             &self.print,
@@ -587,7 +507,6 @@ impl Pipeline {
             &self.print_illuminant,
             self.print_exposure_factor,
         );
-        print_stage_timing(stage_timings, "color_reference", t);
 
         // GPU fast path: dispatch the whole filming→printing→scanning chain
         // (or filming→scanning when scan_film) as a single GPU command
@@ -601,7 +520,6 @@ impl Pipeline {
             && !self.params.film_render.dir_couplers.active
         {
             if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref) {
-                tracing::info!("pipeline: gpu-resident fast path complete");
                 if backend.resident_chain_applies_post_scan() {
                     return out;
                 }
@@ -609,7 +527,6 @@ impl Pipeline {
             }
         }
 
-        let t = Instant::now();
         let log_raw = stages::filming::expose(
             &image,
             &self.film,
@@ -620,31 +537,19 @@ impl Pipeline {
             select_illuminant(&self.front_illuminant),
             color_ref.filming_exposure_correction,
         );
-        log_image_stats("filming_log_exposure", &log_raw);
-        print_stage_timing(stage_timings, "filming_expose", t);
-        let t = Instant::now();
         let filmed = stages::filming::develop(&log_raw, &self.film, &self.params, backend);
-        log_image_stats("filming_density", &filmed);
-        print_stage_timing(stage_timings, "filming_develop", t);
-        tracing::info!("pipeline: filming complete");
 
         if self.params.io.scan_film {
-            let t = Instant::now();
-            let result = stages::scanning::process(
+            stages::scanning::process(
                 &filmed,
                 &self.film,
                 &self.params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
-            );
-            log_image_stats("scan_output_encoded", &result);
-            print_stage_timing(stage_timings, "scanning", t);
-            tracing::info!("pipeline: scanning complete (film scan)");
-            result
+            )
         } else {
-            let t = Instant::now();
-            let (print_log_exposure, printed) = stages::printing::process_with_calibration_diagnostic(
+            let printed = stages::printing::process_with_calibration(
                 &filmed,
                 &self.film,
                 &self.print,
@@ -655,23 +560,14 @@ impl Pipeline {
                 self.preflash_raw,
                 color_ref.printing_exposure_correction,
             );
-            log_image_stats("printing_log_exposure", &print_log_exposure);
-            log_image_stats("printing_density", &printed);
-            print_stage_timing(stage_timings, "printing", t);
-            tracing::info!("pipeline: printing complete");
-            let t = Instant::now();
-            let result = stages::scanning::process(
+            stages::scanning::process(
                 &printed,
                 &self.print,
                 &self.params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
-            );
-            log_image_stats("scan_output_encoded", &result);
-            print_stage_timing(stage_timings, "scanning", t);
-            tracing::info!("pipeline: scanning complete");
-            result
+            )
         }
     }
 
@@ -689,10 +585,6 @@ impl Pipeline {
         {
             return None;
         }
-        tracing::info!(
-            backend = backend.name(),
-            "pipeline: borrowed resident start"
-        );
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
             &self.print,
@@ -1265,7 +1157,11 @@ impl Pipeline {
             front,
             film_log_exposure: &film_log_exp,
             film_density_curves_normalized: &film_curves_norm,
-            film_gamma: self.params.film_render.density_curve_gamma as f64,
+            film_gamma: if self.film.data.density_curves_model.is_some() {
+                1.0
+            } else {
+                self.params.film_render.density_curve_gamma as f64
+            },
             film_channel_density: &film_channel_density,
             film_base_density: &film_base_density,
             print_illuminant: &self.print_illuminant,

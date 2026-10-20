@@ -345,27 +345,6 @@ pub fn process_with_calibration(
     preflash: [f64; 3],
     bw_print_correction: f64,
 ) -> ImageBuf {
-    let (_, printed) = process_with_calibration_diagnostic(
-        cmy_film, film, print, params, backend, print_illuminant,
-        exposure_factor, preflash, bw_print_correction,
-    );
-    printed
-}
-
-/// Printing stage variant that exposes the intermediate log exposure for
-/// Python/Rust parity diagnostics without changing the normal API or pixels.
-#[allow(clippy::too_many_arguments)]
-pub fn process_with_calibration_diagnostic(
-    cmy_film: &ImageBuf,
-    film: &Profile,
-    print: &Profile,
-    params: &RuntimeParams,
-    backend: &dyn ComputeBackend,
-    print_illuminant: &[f64],
-    exposure_factor: f64,
-    preflash: [f64; 3],
-    bw_print_correction: f64,
-) -> (ImageBuf, ImageBuf) {
     let log_raw = expose_calibrated(
         cmy_film,
         film,
@@ -378,7 +357,7 @@ pub fn process_with_calibration_diagnostic(
         bw_print_correction,
     );
     let printed = develop(&log_raw, print, params, backend);
-    (log_raw, printed)
+    printed
 }
 
 /// Full printing stage (simplified — computes illuminant internally).

@@ -8,21 +8,9 @@ use spektrafilm_math::colorspace;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{from_f64, to_f32, to_f64};
 use spektrafilm_math::spectral::{self, TcLut};
-use std::time::Instant;
 
 use crate::params::RuntimeParams;
 use crate::profile::Profile;
-
-fn stage_timings_enabled() -> bool {
-    std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()
-        || std::env::var_os("SPEKTRAFILM_PARITY_STATS").is_some()
-}
-
-fn print_stage_timing(enabled: bool, stage: &str, start: Instant) {
-    if enabled {
-        eprintln!("stage {stage}: {} ms", start.elapsed().as_millis());
-    }
-}
 
 /// Compute pixel size in micrometers from film format and image dimensions.
 pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
@@ -86,7 +74,6 @@ fn measure_autoexposure_ev_target(
         }
         -exposure.log2()
     };
-    tracing::info!(sw = sw, sh = sh, method = method, ev = ev, "autoexposure");
     ev
 }
 
@@ -468,12 +455,10 @@ pub fn expose(
         front_illuminant,
         params.settings.use_cat16,
     );
-    crate::pipeline::log_parity_image_stats("raw_before_auto_exposure", &raw);
     if let Some(ae_ev) = auto_exposure_ev {
         let scale = from_f64(2.0f64.powf(ae_ev as f64));
         raw.data.par_iter_mut().for_each(|v| *v *= scale);
     }
-    crate::pipeline::log_parity_image_stats("raw_after_auto_exposure", &raw);
     let exp_comp = from_f64(2.0f64.powf(params.camera.exposure_compensation_ev as f64));
     raw.data.par_iter_mut().for_each(|v| *v *= exp_comp);
 
@@ -568,29 +553,25 @@ pub fn develop(
     params: &RuntimeParams,
     backend: &dyn ComputeBackend,
 ) -> ImageBuf {
-    let stage_timings = stage_timings_enabled();
     let pix_um = pixel_size_um(params.camera.film_format_mm, log_raw.width, log_raw.height);
     // f64 chain for Python parity — curves are f64 in the profile JSON.
     let log_exposure_f64 = film.log_exposure_f64();
     let density_curves_f64 = film.density_curves_f64();
-    // f32 versions kept for DIR couplers (still f32 API) and grain (legacy).
-    let log_exposure = &film.log_exposure_f32();
-    let density_curves = &film.density_curves_f32();
-    let norm_curves = spektrafilm_model::density_curves::normalize_density_curves(density_curves);
-    let gamma = params.film_render.density_curve_gamma;
+    let gamma = if film.data.density_curves_model.is_some() {
+        1.0
+    } else {
+        params.film_render.density_curve_gamma as f64
+    };
 
     // Filming.develop uses NORMALIZED curves (Python `develop` subtracts nanmin).
     let norm_curves_f64 =
         spektrafilm_model::density_curves::normalize_density_curves_f64(&density_curves_f64);
-    let t = Instant::now();
     let mut density_cmy =
-        backend.density_curve_interp(log_raw, &log_exposure_f64, &norm_curves_f64, gamma as f64);
-    print_stage_timing(stage_timings, "filming_develop.density_interp", t);
+        backend.density_curve_interp(log_raw, &log_exposure_f64, &norm_curves_f64, gamma);
 
     // DIR couplers
     let dir = &params.film_render.dir_couplers;
     if dir.active {
-        let t = Instant::now();
         let matrix = spektrafilm_model::couplers::compute_dir_couplers_matrix(
             dir.gamma_samelayer_rgb,
             dir.gamma_interlayer_r_to_gb,
@@ -611,17 +592,15 @@ pub fn develop(
             dir.diffusion_tail_um,
             dir.diffusion_tail_weight,
             film.is_positive(),
-            gamma as f64,
+            gamma,
             backend,
             dir.langmuir_donor_k_rgb,
         );
-        print_stage_timing(stage_timings, "filming_develop.dir_couplers", t);
     }
 
     // Grain
     let grain = &params.film_render.grain;
     if grain.active && !params.debug.deactivate_stochastic_effects {
-        let t = Instant::now();
         // Use f64 throughout — Python reads these from JSON as f64; the
         // f32 storage in `GrainParams` would otherwise truncate to ~7
         // decimals and shift every Poisson lambda by ~5e-8, producing a
@@ -677,7 +656,6 @@ pub fn develop(
                 backend,
             );
         }
-        print_stage_timing(stage_timings, "filming_develop.grain", t);
     }
 
     density_cmy

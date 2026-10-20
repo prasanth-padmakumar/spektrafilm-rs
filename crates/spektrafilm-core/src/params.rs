@@ -496,6 +496,8 @@ pub struct FilmRenderingParams {
     #[serde(default)]
     pub development_time: Option<f64>,
     #[serde(default)]
+    pub chemistry: FilmChemistryParams,
+    #[serde(default)]
     pub grain: GrainParams,
     #[serde(default)]
     pub halation: HalationParams,
@@ -510,10 +512,49 @@ impl Default for FilmRenderingParams {
         Self {
             density_curve_gamma: 1.0,
             development_time: None,
+            chemistry: FilmChemistryParams::default(),
             grain: GrainParams::default(),
             halation: HalationParams::default(),
             dir_couplers: DirCouplersParams::default(),
             glare: GlareParams::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmChemistryParams {
+    #[serde(default)]
+    pub development_time: Option<f64>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor: f64,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor_fast: f64,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor_slow: f64,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor_red: f64,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor_green: f64,
+    #[serde(default = "default_one_f64")]
+    pub gamma_factor_blue: f64,
+    #[serde(default)]
+    pub developer_exhaustion: f64,
+}
+
+impl Default for FilmChemistryParams {
+    fn default() -> Self {
+        Self {
+            development_time: None,
+            active: true,
+            gamma_factor: 1.0,
+            gamma_factor_fast: 1.0,
+            gamma_factor_slow: 1.0,
+            gamma_factor_red: 1.0,
+            gamma_factor_green: 1.0,
+            gamma_factor_blue: 1.0,
+            developer_exhaustion: 0.0,
         }
     }
 }
@@ -959,6 +1000,33 @@ mod tests {
         assert_eq!(grain.mult_usm_sigma, 0.7);
         assert_eq!(grain.mult_usm_amount, 1.5);
         assert_eq!(grain.blur_dye_clouds_um, 2.0);
+    }
+
+    #[test]
+    fn python_film_chemistry_settings_deserialize_into_rust() {
+        let params: RuntimeParams = serde_json::from_str(
+            r#"{
+                "film_render": {
+                    "chemistry": {
+                        "development_time": 1.0,
+                        "active": true,
+                        "gamma_factor": 1.0,
+                        "gamma_factor_fast": 1.0,
+                        "gamma_factor_slow": 1.0,
+                        "gamma_factor_red": 1.0,
+                        "gamma_factor_green": 1.0,
+                        "gamma_factor_blue": 1.0,
+                        "developer_exhaustion": 0.0
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let chemistry = params.film_render.chemistry;
+        assert_eq!(chemistry.development_time, Some(1.0));
+        assert!(chemistry.active);
+        assert_eq!(chemistry.gamma_factor_fast, 1.0);
+        assert_eq!(chemistry.developer_exhaustion, 0.0);
     }
 }
 fn default_hanatos() -> String {

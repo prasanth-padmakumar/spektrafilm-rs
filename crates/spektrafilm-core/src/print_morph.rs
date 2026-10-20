@@ -388,6 +388,44 @@ pub fn morph_density_curves(
     Ok(out)
 }
 
+/// Evaluate total and per-layer curves from the fitted model using the same
+/// optional chemistry morph. Layer output is `[n_samples][n_layers][3]`.
+pub fn morph_density_curves_with_layers(
+    log_exposure: &[f64],
+    model: &DensityCurvesModel,
+    p: &PrintCurvesMorphParams,
+    positive: bool,
+) -> Result<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>), String> {
+    let total = morph_density_curves(log_exposure, model, p, positive)?;
+    let n_layers = model.n_layers();
+    let mut layers = vec![vec![[0.0; 3]; n_layers]; log_exposure.len()];
+
+    for channel in 0..3 {
+        let (centers, amplitudes, sigmas, mix) = if p.active {
+            morph_channel_params(model, p, channel, positive)
+        } else {
+            (
+                model.centers[channel].clone(),
+                model.amplitudes[channel].clone(),
+                model.sigmas[channel].clone(),
+                vec![0.0; n_layers],
+            )
+        };
+        for layer in 0..n_layers {
+            for (sample, &exposure) in log_exposure.iter().enumerate() {
+                layers[sample][layer][channel] = amplitudes[layer]
+                    * layer_cdf(
+                        (exposure - centers[layer]) / sigmas[layer],
+                        positive,
+                        mix[layer],
+                    );
+            }
+        }
+    }
+
+    Ok((total, layers))
+}
+
 #[cfg(test)]
 mod parity_tests {
     use super::*;
@@ -516,6 +554,81 @@ mod parity_tests {
                     d += model.amplitudes[c][l] * norm_cdf(signed_z(z, positive));
                 }
                 assert!((morphed[i][c] - d).abs() < 1e-15, "row {i} ch {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn portra_800_runtime_curve_samples_match_python_reference() {
+        let dir = data_dir();
+        let film = crate::profile::load_profile_by_name(&dir, "kodak_portra_800").unwrap();
+        let model = film.data.density_curves_model.as_ref().unwrap();
+        let log_exposure = film.log_exposure_f64();
+        let identity = PrintCurvesMorphParams {
+            active: true,
+            ..Default::default()
+        };
+        let (curves, layers) =
+            morph_density_curves_with_layers(&log_exposure, model, &identity, film.is_positive())
+                .unwrap();
+
+        let python_samples = [
+            (
+                0,
+                [
+                    4.1203275492412e-6,
+                    8.496023726545535e-6,
+                    4.182034063681222e-6,
+                ],
+            ),
+            (
+                64,
+                [
+                    0.12368028238932825,
+                    0.15366428319037784,
+                    0.12361269484984702,
+                ],
+            ),
+            (
+                128,
+                [1.0110739906521142, 1.0092074201834509, 1.0266882937033213],
+            ),
+            (
+                192,
+                [1.8232844230303125, 1.6913134188408978, 1.9129931682524293],
+            ),
+            (
+                255,
+                [1.8977042376644069, 1.7305684326967494, 2.0244040540504895],
+            ),
+        ];
+        for (sample, expected_row) in python_samples {
+            for (channel, expected) in expected_row.iter().enumerate() {
+                assert!(
+                    (curves[sample][channel] - expected).abs() < 2e-10,
+                    "sample {sample}, channel {channel}: {} != {expected}",
+                    curves[sample][channel]
+                );
+            }
+        }
+
+        let expected_max = [1.8977042376644069, 1.7305684326967494, 2.0244040540504895];
+        for channel in 0..3 {
+            let actual_max = curves
+                .iter()
+                .map(|row| row[channel])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                (actual_max - expected_max[channel]).abs() < 1e-6,
+                "channel {channel} max: {actual_max} != {}",
+                expected_max[channel]
+            );
+            for (sample, curve) in curves.iter().enumerate() {
+                let layer_sum: f64 = layers[sample].iter().map(|layer| layer[channel]).sum();
+                assert!(
+                    (layer_sum - curve[channel]).abs() < 1e-12,
+                    "layer sum mismatch at sample {sample}, channel {channel}"
+                );
             }
         }
     }
