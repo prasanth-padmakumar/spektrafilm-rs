@@ -10,34 +10,125 @@ use std::time::Instant;
 
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
+use spektrafilm_math::precision::to_f64;
 use spektrafilm_math::spectral::TcLut;
 
-/// Diagnostic helper: when env var `$var` is set, dump the image's f64
-/// pixel data to that path as a raw little-endian f64 blob. Used to
-/// bisect the Python ↔ Rust drift one stage at a time without
-/// modifying call sites. Silent no-op when the env var is unset.
-fn dump_if_env(var: &str, image: &ImageBuf) {
-    let Ok(path) = std::env::var(var) else {
+fn log_image_stats(stage: &str, image: &ImageBuf) {
+    if !tracing::enabled!(tracing::Level::INFO) {
         return;
-    };
-    let bytes: Vec<u8> = image
-        .data
-        .iter()
-        .flat_map(|&v| (v as f64).to_le_bytes())
-        .collect();
-    match std::fs::write(&path, &bytes) {
-        Ok(()) => tracing::info!(
-            path = %path,
-            count = image.data.len(),
-            "dumped f64 buffer for {}",
-            var
-        ),
-        Err(e) => tracing::error!("dump {var} → {path}: {e}"),
     }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    let mut channel_sum = [0.0; 3];
+    let mut invalid = 0usize;
+    let mut chroma_sum = 0.0;
+    let mut chroma_max: f64 = 0.0;
+    for (i, value) in image.data.iter().enumerate() {
+        let value = to_f64(*value);
+        if !value.is_finite() {
+            invalid += 1;
+        }
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+        channel_sum[i % 3] += value;
+    }
+    for pixel in image.data.chunks_exact(3) {
+        let r = to_f64(pixel[0]);
+        let g = to_f64(pixel[1]);
+        let b = to_f64(pixel[2]);
+        if r.is_finite() && g.is_finite() && b.is_finite() {
+            let chroma = r.max(g).max(b) - r.min(g).min(b);
+            chroma_sum += chroma;
+            chroma_max = chroma_max.max(chroma);
+        }
+    }
+    let n = image.data.len() as f64;
+    let pixels = image.pixel_count() as f64;
+    tracing::info!(
+        stage,
+        width = image.width,
+        height = image.height,
+        min,
+        max,
+        mean = sum / n,
+        channel_mean_r = channel_sum[0] / pixels,
+        channel_mean_g = channel_sum[1] / pixels,
+        channel_mean_b = channel_sum[2] / pixels,
+        invalid,
+        chroma_mean = chroma_sum / pixels,
+        chroma_max,
+        "pipeline image statistics"
+    );
+}
+
+pub(crate) fn log_parity_image_stats(stage: &str, image: &ImageBuf) {
+    if std::env::var_os("SPEKTRAFILM_PARITY_STATS").is_none()
+        || !tracing::enabled!(tracing::Level::INFO)
+        || image.data.is_empty()
+    {
+        return;
+    }
+
+    const MAX_PERCENTILE_SAMPLES: usize = 1_000_000;
+    let sample_step = image.data.len().div_ceil(MAX_PERCENTILE_SAMPLES);
+    let mut percentile_samples = Vec::with_capacity(image.data.len().min(MAX_PERCENTILE_SAMPLES));
+    let mut channel_sum = [0.0; 3];
+    let mut channel_count = [0usize; 3];
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for (i, value) in image.data.iter().enumerate() {
+        let value = to_f64(*value);
+        if !value.is_finite() {
+            continue;
+        }
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+        count += 1;
+        channel_sum[i % 3] += value;
+        channel_count[i % 3] += 1;
+        if i % sample_step == 0 {
+            percentile_samples.push(value);
+        }
+    }
+    if percentile_samples.is_empty() {
+        return;
+    }
+    percentile_samples.sort_by(f64::total_cmp);
+
+    let percentile = |q: f64| {
+        let index = q * (percentile_samples.len() - 1) as f64;
+        let lower = index.floor() as usize;
+        let upper = index.ceil() as usize;
+        let fraction = index - lower as f64;
+        percentile_samples[lower] * (1.0 - fraction) + percentile_samples[upper] * fraction
+    };
+    let mean = sum / count as f64;
+    tracing::info!(
+        stage,
+        width = image.width,
+        height = image.height,
+        min,
+        max,
+        mean,
+        median = percentile(0.5),
+        p01 = percentile(0.01),
+        p99 = percentile(0.99),
+        percentile_sample_count = percentile_samples.len(),
+        channel_mean_r = channel_sum[0] / channel_count[0] as f64,
+        channel_mean_g = channel_sum[1] / channel_count[1] as f64,
+        channel_mean_b = channel_sum[2] / channel_count[2] as f64,
+        "parity image statistics"
+    );
 }
 
 fn stage_timings_enabled() -> bool {
     std::env::var_os("SPEKTRAFILM_STAGE_TIMINGS").is_some()
+        || std::env::var_os("SPEKTRAFILM_PARITY_STATS").is_some()
 }
 
 fn print_stage_timing(enabled: bool, stage: &str, start: Instant) {
@@ -53,18 +144,6 @@ use crate::spectral_service;
 use crate::stages;
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
-    if film.is_positive() {
-        params.film_render.dir_couplers.gamma_samelayer_rgb = [0.12, 0.08, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_r_to_gb = [0.12, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_g_to_rb = [0.08, 0.06];
-        params.film_render.dir_couplers.gamma_interlayer_b_to_rg = [0.06, 0.06];
-    } else if film.is_negative() {
-        params.film_render.dir_couplers.gamma_samelayer_rgb = [0.336, 0.319, 0.273];
-        params.film_render.dir_couplers.gamma_interlayer_r_to_gb = [0.353, 0.302];
-        params.film_render.dir_couplers.gamma_interlayer_g_to_rb = [0.154, 0.353];
-        params.film_render.dir_couplers.gamma_interlayer_b_to_rg = [0.168, 0.226];
-    }
-
     // Monochrome grain is derived from the film, never user-set — clear it
     // for colour so a stray params file can't correlate the colour channels'
     // noise.
@@ -104,7 +183,7 @@ pub struct Pipeline {
     /// exclusive with `tc_lut`.
     mallett_core: Option<[[f64; 3]; 3]>,
     /// Illuminant used by the RGB→tc projection before TC LUT lookup.
-    /// Most methods use the film reference illuminant; arctic2026alpha02
+    /// Most methods use the film reference illuminant; arctic2026beta02
     /// recovers reflectance in D65 coordinates and relights separately.
     front_illuminant: String,
     /// Print exposure normalization factor (1/geomean of midgray raw through enlarger).
@@ -248,12 +327,13 @@ impl Pipeline {
         let ref_illuminant_f64 = select_illuminant_f64(&film.info.reference_illuminant);
         let mut front_illuminant = film.info.reference_illuminant.clone();
 
-        // RGB → film raw upsampler. Default `hanatos2025` builds the spectral tc
-        // LUT; `mallett2019` builds a 3×3 reflectance-basis matrix instead (no
-        // LUT). Dispatch mirrors Python `_rgb_to_film_raw`.
+        // RGB → film raw upsampler. `hanatos2025` and `hanatos2026` both use
+        // the spectral TC LUT path; 2026 uses the normalized UV/IR window and
+        // intentionally does not apply the 2025 surface adaptation or blur.
+        // `mallett2019` builds a 3×3 reflectance-basis matrix instead (no LUT).
         let (tc_lut, mallett_core): (Option<TcLut>, Option<[[f64; 3]; 3]>) =
             match params.settings.rgb_to_raw_method.as_str() {
-                "hanatos2025" => {
+                "hanatos2025" | "hanatos2026" => {
                     let spectra_lut = spectral_service::load_spectra_lut(data_dir)?;
                     let window_params: Vec<f64> =
                         film.data.hanatos2025_adaptation_window_params.clone();
@@ -285,9 +365,9 @@ impl Pipeline {
                     };
                     (Some(tc_lut), None)
                 }
-                "arctic2026alpha02" => {
+                "arctic2026beta02" => {
                     front_illuminant = "D65".into();
-                    let reflectance_lut = spectral_service::load_arctic2026alpha02_lut(data_dir)?;
+                    let reflectance_lut = spectral_service::load_arctic2026beta02_lut(data_dir)?;
                     let tc_lut = spectral_service::compute_reflectance_tc_lut(
                         &reflectance_lut,
                         &sensitivity,
@@ -305,6 +385,24 @@ impl Pipeline {
                     } else {
                         tc_lut
                     };
+                    (Some(tc_lut), None)
+                }
+                "arctic2026beta04" => {
+                    front_illuminant = "D65".into();
+                    let reflectance_lut = spectral_service::load_arctic2026beta04_lut(data_dir)?;
+                    let tc_lut = spectral_service::compute_reflectance_tc_lut(
+                        &reflectance_lut, &sensitivity, ref_illuminant_f64,
+                    );
+                    let input_gamut = crate::input_gamut::InputGamutCompress::build(
+                        &params.io.input_gamut_compress.algorithm,
+                        params.io.input_gamut_compress.knee,
+                    )?;
+                    let tc_lut = if input_gamut.is_active() {
+                        let (rx, ry) = spektrafilm_math::spectral::illuminant_to_xy(
+                            select_illuminant(&front_illuminant),
+                        );
+                        input_gamut.remap(&tc_lut, [rx, ry])
+                    } else { tc_lut };
                     (Some(tc_lut), None)
                 }
                 "mallett2019" => (
@@ -468,8 +566,15 @@ impl Pipeline {
         // from the image dims, so it follows automatically.
         let t = Instant::now();
         let image = self.rescale_working(image);
+        log_image_stats("input_rescaled", &image);
         print_stage_timing(stage_timings, "rescale", t);
-        tracing::info!(backend = backend.name(), "pipeline: start");
+        tracing::info!(
+            backend = backend.name(),
+            run_id = std::env::var("SPEKTRAFILM_RUN_ID").as_deref().unwrap_or("unavailable"),
+            input_sha256 = std::env::var("SPEKTRAFILM_INPUT_SHA256").as_deref().unwrap_or("unavailable"),
+            parameters_sha256 = std::env::var("SPEKTRAFILM_PARAMETERS_SHA256").as_deref().unwrap_or("unavailable"),
+            "pipeline: start"
+        );
 
         // Scanner B&W/slide exposure correction (no-op unless scanner
         // white/black correction is on for a slide or print scan). Computed
@@ -490,7 +595,11 @@ impl Pipeline {
         // extended resident chain, including camera/scanner lens blur,
         // highlight boost, and enlarger diffusion. Backends that do not
         // implement the resident chain return `None` and fall through.
-        if self.tc_lut.is_some() || self.mallett_core.is_some() {
+        // DIR parity requires the f64 CPU implementation. The resident
+        // chain uses f32 kernels, so bypass it whenever DIR is active.
+        if (self.tc_lut.is_some() || self.mallett_core.is_some())
+            && !self.params.film_render.dir_couplers.active
+        {
             if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref) {
                 tracing::info!("pipeline: gpu-resident fast path complete");
                 if backend.resident_chain_applies_post_scan() {
@@ -511,13 +620,13 @@ impl Pipeline {
             select_illuminant(&self.front_illuminant),
             color_ref.filming_exposure_correction,
         );
+        log_image_stats("filming_log_exposure", &log_raw);
         print_stage_timing(stage_timings, "filming_expose", t);
-        dump_if_env("SPEKTRAFILM_DUMP_FILM_LOG_RAW", &log_raw);
         let t = Instant::now();
         let filmed = stages::filming::develop(&log_raw, &self.film, &self.params, backend);
+        log_image_stats("filming_density", &filmed);
         print_stage_timing(stage_timings, "filming_develop", t);
         tracing::info!("pipeline: filming complete");
-        dump_if_env("SPEKTRAFILM_DUMP_FILM_DENSITY", &filmed);
 
         if self.params.io.scan_film {
             let t = Instant::now();
@@ -529,12 +638,13 @@ impl Pipeline {
                 &color_ref,
                 &self.output_gamut,
             );
+            log_image_stats("scan_output_encoded", &result);
             print_stage_timing(stage_timings, "scanning", t);
             tracing::info!("pipeline: scanning complete (film scan)");
             result
         } else {
             let t = Instant::now();
-            let printed = stages::printing::process_with_calibration(
+            let (print_log_exposure, printed) = stages::printing::process_with_calibration_diagnostic(
                 &filmed,
                 &self.film,
                 &self.print,
@@ -545,9 +655,10 @@ impl Pipeline {
                 self.preflash_raw,
                 color_ref.printing_exposure_correction,
             );
+            log_image_stats("printing_log_exposure", &print_log_exposure);
+            log_image_stats("printing_density", &printed);
             print_stage_timing(stage_timings, "printing", t);
             tracing::info!("pipeline: printing complete");
-            dump_if_env("SPEKTRAFILM_DUMP_PRINT_DENSITY", &printed);
             let t = Instant::now();
             let result = stages::scanning::process(
                 &printed,
@@ -557,6 +668,7 @@ impl Pipeline {
                 &color_ref,
                 &self.output_gamut,
             );
+            log_image_stats("scan_output_encoded", &result);
             print_stage_timing(stage_timings, "scanning", t);
             tracing::info!("pipeline: scanning complete");
             result
@@ -572,10 +684,15 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if self.tc_lut.is_none() && self.mallett_core.is_none() {
+        if (self.tc_lut.is_none() && self.mallett_core.is_none())
+            || self.params.film_render.dir_couplers.active
+        {
             return None;
         }
-        tracing::info!(backend = backend.name(), "pipeline: borrowed resident start");
+        tracing::info!(
+            backend = backend.name(),
+            "pipeline: borrowed resident start"
+        );
         let color_ref = crate::color_reference::ColorReference::compute(
             &self.film,
             &self.print,
@@ -596,7 +713,7 @@ impl Pipeline {
     /// Lets callers trade resolution for speed (the whole pipeline, and the
     /// diffusion-filter kernel, scale with the image).
     fn rescale_working(&self, image: ImageBuf) -> ImageBuf {
-        use spektrafilm_math::precision::{Scalar, from_f32, to_f32};
+        use spektrafilm_math::precision::{from_f32, to_f32, Scalar};
         let uf = self.params.io.upscale_factor;
         if uf <= 0.0 || (uf - 1.0).abs() < 1e-6 {
             return image;
@@ -630,6 +747,11 @@ impl Pipeline {
         backend: &dyn ComputeBackend,
         color_ref: &crate::color_reference::ColorReference,
     ) -> Option<ImageBuf> {
+        // The resident shaders currently implement sRGB encoding and do not
+        // implement Python's percentile-based output auto-levels.
+        if self.params.io.output_color_space != "sRGB" || self.params.io.auto_levels != "Off" {
+            return None;
+        }
         // Bake the exposure scale (auto-exposure × manual EV compensation)
         // into the front-pass matrix. Both upsamplers (hanatos and mallett)
         // are homogeneous in the input RGB, so scaling the matrix is
@@ -927,16 +1049,17 @@ impl Pipeline {
                     matrix_scaled[2][2] as f32,
                 ],
             ];
-            let density_curves_0_f32 = spektrafilm_model::couplers::compute_curves_before_dir(
-                &norm_curves_f32,
-                &film_log_exp_f32,
-                &matrix_scaled_f32,
+            let norm_curves_f64: Vec<[f64; 3]> = norm_curves_f32.iter().map(|r| [r[0] as f64, r[1] as f64, r[2] as f64]).collect();
+            let film_log_exp_f64: Vec<f64> = film_log_exp_f32.iter().map(|&v| v as f64).collect();
+            let matrix_scaled_f64: [[f64; 3]; 3] = matrix_scaled_f32.map(|r| r.map(|v| v as f64));
+            let density_curves_0_f64 = spektrafilm_model::couplers::compute_curves_before_dir(
+                &norm_curves_f64,
+                &film_log_exp_f64,
+                &matrix_scaled_f64,
                 self.film.is_positive(),
+                [0.0; 3],
+                [0.0; 3],
             );
-            let density_curves_0_f64: Vec<[f64; 3]> = density_curves_0_f32
-                .iter()
-                .map(|row| [row[0] as f64, row[1] as f64, row[2] as f64])
-                .collect();
             let density_max_f32 = spektrafilm_model::density_curves::max_density(&norm_curves_f32);
             Some((
                 density_curves_0_f64,
@@ -948,6 +1071,16 @@ impl Pipeline {
                 dir.diffusion_tail_weight,
                 self.film.is_positive(),
                 self.params.film_render.density_curve_gamma as f64,
+                [
+                    (dir.langmuir_donor_k_rgb[0] * density_max_f32[0] as f64) as f32,
+                    (dir.langmuir_donor_k_rgb[1] * density_max_f32[1] as f64) as f32,
+                    (dir.langmuir_donor_k_rgb[2] * density_max_f32[2] as f64) as f32,
+                ],
+                [
+                    (density_max_f32[0] * 0.5) as f32,
+                    (density_max_f32[1] * 0.5) as f32,
+                    (density_max_f32[2] * 0.5) as f32,
+                ],
             ))
         } else {
             None
@@ -966,6 +1099,8 @@ impl Pipeline {
                 diffusion_size_px: (d.4 / d.3 as f64) as f32,
                 diffusion_tail_px: (d.5 / d.3 as f64) as f32,
                 diffusion_tail_weight: d.6 as f32,
+                donor_k: d.9,
+                donor_ref: d.10,
                 density_curves_0: &d.0,
                 log_exposure: &film_log_exp,
                 gamma_factor: d.8,

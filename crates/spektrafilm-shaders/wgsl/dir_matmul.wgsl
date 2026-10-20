@@ -13,6 +13,8 @@ struct Params {
     _pad0: u32,
     _pad1: u32,
     density_max: vec4<f32>, // .xyz used, .w padding
+    donor_k: vec4<f32>,
+    donor_ref: vec4<f32>,
     // Row-major couplers matrix [3][3], packed as three vec4s
     // (.w padding to satisfy std140 alignment).
     m_row0: vec4<f32>,
@@ -38,6 +40,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if params.positive != 0u {
         silver = params.density_max.xyz - silver;
     }
+    silver = silver * (params.donor_k.xyz + params.donor_ref.xyz)
+        / (params.donor_k.xyz + silver);
 
     // correction[m] = silver[0]*M[0][m] + silver[1]*M[1][m] + silver[2]*M[2][m]
     let c0 = silver.x * params.m_row0.x + silver.y * params.m_row1.x + silver.z * params.m_row2.x;

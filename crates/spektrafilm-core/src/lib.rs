@@ -1,3 +1,4 @@
+pub mod auto_levels;
 pub mod color_reference;
 pub mod data;
 pub mod enlarger;

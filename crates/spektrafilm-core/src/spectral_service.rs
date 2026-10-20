@@ -86,34 +86,34 @@ pub fn load_spectra_lut(data_dir: &Path) -> Result<SpectraLut, String> {
     })
 }
 
-/// Load the arctic2026alpha02 effective-reflectance LUT.
+/// Load the arctic2026beta02 effective-reflectance LUT.
 ///
 /// Shape: (size, size, 81). The table is a D65-recovered unit-bright
 /// reflectance surface in triangular coordinates. At render time we relight it
 /// by the film reference illuminant before integrating against film
 /// sensitivity.
-pub fn load_arctic2026alpha02_lut(data_dir: &Path) -> Result<SpectraLut, String> {
+pub fn load_arctic2026beta02_lut(data_dir: &Path) -> Result<SpectraLut, String> {
     let path = data_dir
         .join("luts")
         .join("spectral_upsampling")
-        .join("arctic2026alpha02")
+        .join("arctic2026beta02")
         .join("reflectance_xy_tc.npy");
 
     let file = std::fs::File::open(&path)
-        .map_err(|e| format!("opening arctic2026alpha02 LUT {}: {e}", path.display()))?;
+        .map_err(|e| format!("opening arctic2026beta02 LUT {}: {e}", path.display()))?;
     let reader = std::io::BufReader::new(file);
 
     let (shape, data) =
-        npy::load_npy_f32(reader).map_err(|e| format!("loading arctic2026alpha02 LUT: {e}"))?;
+        npy::load_npy_f32(reader).map_err(|e| format!("loading arctic2026beta02 LUT: {e}"))?;
 
     if shape.len() != 3 || shape[2] != N_WAVELENGTHS {
         return Err(format!(
-            "arctic2026alpha02 LUT shape mismatch: expected (N, N, {N_WAVELENGTHS}), got {shape:?}"
+            "arctic2026beta02 LUT shape mismatch: expected (N, N, {N_WAVELENGTHS}), got {shape:?}"
         ));
     }
     if shape[0] != shape[1] {
         return Err(format!(
-            "arctic2026alpha02 LUT must be square, got {}x{}",
+            "arctic2026beta02 LUT must be square, got {}x{}",
             shape[0], shape[1]
         ));
     }
@@ -123,6 +123,19 @@ pub fn load_arctic2026alpha02_lut(data_dir: &Path) -> Result<SpectraLut, String>
         n_wavelengths: shape[2],
         data,
     })
+}
+
+/// Load the Arctic 2026 beta04 reflectance LUT.
+pub fn load_arctic2026beta04_lut(data_dir: &Path) -> Result<SpectraLut, String> {
+    let path = data_dir.join("luts/spectral_upsampling/arctic2026beta04/reflectance_xy_tc.npy");
+    let file = std::fs::File::open(&path)
+        .map_err(|e| format!("opening arctic2026beta04 LUT {}: {e}", path.display()))?;
+    let (shape, data) = npy::load_npy_f32(std::io::BufReader::new(file))
+        .map_err(|e| format!("loading arctic2026beta04 LUT: {e}"))?;
+    if shape.len() != 3 || shape[2] != N_WAVELENGTHS || shape[0] != shape[1] {
+        return Err(format!("arctic2026beta04 LUT shape mismatch: {shape:?}"));
+    }
+    Ok(SpectraLut { size: shape[0], n_wavelengths: shape[2], data })
 }
 
 pub struct SpectraLut {

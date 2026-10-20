@@ -982,6 +982,7 @@ impl App {
                         .selected_text(method.clone())
                         .show_ui(ui, |ui| {
                             for opt in [
+                                "hybrid",
                                 "average",
                                 "median",
                                 "center_weighted",
@@ -1160,6 +1161,17 @@ impl App {
                 let g = &mut self.params.film_render.grain;
                 let mut changed = false;
                 changed |= ui.checkbox(&mut g.active, "Active").changed();
+                egui::ComboBox::from_label("Grain model")
+                    .selected_text(match g.model.as_str() {
+                        "rms" => "RMS granularity",
+                        "monte_carlo" | "synthesis" => "Monte Carlo Boolean (HQ)",
+                        _ => "Layered dye particles",
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut g.model, "layered".into(), "Layered dye particles").changed();
+                        changed |= ui.selectable_value(&mut g.model, "rms".into(), "RMS granularity").changed();
+                        changed |= ui.selectable_value(&mut g.model, "monte_carlo".into(), "Monte Carlo Boolean (HQ)").changed();
+                    });
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut g.agx_particle_area_um2, 0.05..=1.0)
@@ -1172,6 +1184,15 @@ impl App {
                 changed |= ui
                     .add(egui::Slider::new(&mut g.n_sub_layers, 1..=4).text("Sub-layers"))
                     .changed();
+                if g.model == "monte_carlo" || g.model == "synthesis" {
+                    ui.separator();
+                    ui.label("Monte Carlo physical grain");
+                    changed |= ui.add(egui::Slider::new(&mut g.synthesis_samples, 4..=128).text("Aperture samples")).changed();
+                    changed |= ui.add(egui::Slider::new(&mut g.synthesis_mean_radius_um, 0.15..=2.0).text("Mean radius (µm)")).changed();
+                    changed |= ui.add(egui::Slider::new(&mut g.synthesis_radius_stddev_ratio, 0.05..=1.0).text("Radius variation")).changed();
+                    changed |= ui.add(egui::Slider::new(&mut g.synthesis_amount, 0.0..=1.0).text("Amount")).changed();
+                    ui.small("Physical grain dimensions are in µm; pixel sampling is derived from the selected film format.");
+                }
                 if changed {
                     self.dirty = true;
                 }
@@ -1326,16 +1347,32 @@ impl App {
                     )
                     .changed();
                 // RGB → film raw spectral upsampler. hanatos2025 is the default
-                // spectral LUT; arctic2026alpha02 is the new memory-color
-                // reflectance LUT; mallett2019 is a faster matrix basis.
+                // spectral LUT, hanatos2026 adds the normalized UV/IR window;
+                // arctic2026beta02 is the current memory-color reflectance LUT;
+                // mallett2019 is a faster matrix basis.
                 let method = &mut self.params.settings.rgb_to_raw_method;
                 egui::ComboBox::from_label("RGB→raw upsampling")
                     .selected_text(method.clone())
                     .show_ui(ui, |ui| {
-                        for opt in ["hanatos2025", "arctic2026alpha02", "mallett2019"] {
+                        for opt in ["hanatos2025", "hanatos2026", "arctic2026beta02", "arctic2026beta04", "mallett2019"] {
                             changed |= ui.selectable_value(method, opt.to_string(), opt).changed();
                         }
                     });
+                egui::ComboBox::from_label("Input color space")
+                    .selected_text(self.params.io.input_color_space.clone())
+                    .show_ui(ui, |ui| {
+                        for opt in ["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ACEScg", "ACES2065-1"] {
+                            changed |= ui.selectable_value(
+                                &mut self.params.io.input_color_space,
+                                opt.to_string(),
+                                opt,
+                            ).changed();
+                        }
+                    });
+                changed |= ui.checkbox(
+                    &mut self.params.io.input_cctf_decoding,
+                    "Apply input CCTF decoding",
+                ).changed();
                 if changed {
                     self.dirty = true;
                 }
@@ -1425,8 +1462,19 @@ impl App {
                     )
                     .changed();
                 changed |= ui
-                    .checkbox(&mut io.output_cctf_encoding, "Output sRGB encoded")
+                    .checkbox(&mut io.output_cctf_encoding, "Output color-space encoded")
                     .changed();
+                egui::ComboBox::from_label("Output color space")
+                    .selected_text(io.output_color_space.clone())
+                    .show_ui(ui, |ui| {
+                        for opt in ["sRGB", "Display P3", "Adobe RGB (1998)", "ProPhoto RGB", "ACEScg", "ACES2065-1"] {
+                            changed |= ui.selectable_value(
+                                &mut io.output_color_space,
+                                opt.to_string(),
+                                opt,
+                            ).changed();
+                        }
+                    });
                 if changed {
                     self.dirty = true;
                 }

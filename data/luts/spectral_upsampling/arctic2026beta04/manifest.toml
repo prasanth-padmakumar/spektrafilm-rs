@@ -1,0 +1,12 @@
+identifier = "arctic2026beta04"
+file = "reflectance_xy_tc.npy"
+kind = "reflectance"
+title = "arctic2026 (beta04)"
+lut_size = 192
+bands = 81
+spectral_shape = [380, 780, 5]
+dtype = "float16"
+observer = "CIE 1931 2 Degree Standard Observer"
+scene_illuminant = "D65"
+midgray = 0.184
+bounded = false

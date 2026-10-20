@@ -356,7 +356,8 @@ pub fn scan(
             spektrafilm_model::diffusion::apply_unsharp_mask(&rgb, usm_sigma, usm_amount, backend);
     }
 
-    // CCTF encoding + clip.
+    // Output transfer function. Python applies auto-levels after encoding and
+    // does not clip first when that operation is enabled.
     //
     // Python's `_apply_cctf_encoding_and_clip` calls
     // `colour.RGB_to_RGB(rgb, output_cs, output_cs, apply_cctf_encoding=True)`,
@@ -371,6 +372,8 @@ pub fn scan(
     let one = from_f64(1.0);
     if params.io.output_cctf_encoding {
         let m = rgb_to_rgb_identity_matrix(&params.io.output_color_space);
+        let encode =
+            spektrafilm_math::precision::output_cctf_encoder(&params.io.output_color_space);
         rgb.data.par_chunks_exact_mut(3).for_each(|px| {
             let r = px[0] as f64;
             let g = px[1] as f64;
@@ -378,10 +381,14 @@ pub fn scan(
             let r2 = m[0][0] * r + m[0][1] * g + m[0][2] * b;
             let g2 = m[1][0] * r + m[1][1] * g + m[1][2] * b;
             let b2 = m[2][0] * r + m[2][1] * g + m[2][2] * b;
-            px[0] = spektrafilm_math::precision::srgb_encode(from_f64(r2).clamp(zero, one));
-            px[1] = spektrafilm_math::precision::srgb_encode(from_f64(g2).clamp(zero, one));
-            px[2] = spektrafilm_math::precision::srgb_encode(from_f64(b2).clamp(zero, one));
+            px[0] = from_f64(encode(r2));
+            px[1] = from_f64(encode(g2));
+            px[2] = from_f64(encode(b2));
         });
+    }
+
+    if params.io.auto_levels != "Off" {
+        crate::auto_levels::apply(&mut rgb, &params.io.auto_levels);
     } else {
         rgb.data
             .par_iter_mut()

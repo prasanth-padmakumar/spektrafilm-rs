@@ -885,6 +885,8 @@ extern "C" __global__ void dir_matmul_kernel(
     float dmax_r,
     float dmax_g,
     float dmax_b,
+    const float* __restrict__ donor_k,
+    const float* __restrict__ donor_ref,
     const float* __restrict__ matrix,
     float* __restrict__ correction
 ) {
@@ -899,6 +901,9 @@ extern "C" __global__ void dir_matmul_kernel(
         s1 = dmax_g - s1;
         s2 = dmax_b - s2;
     }
+    s0 = s0 * (donor_k[0] + donor_ref[0]) / (donor_k[0] + s0);
+    s1 = s1 * (donor_k[1] + donor_ref[1]) / (donor_k[1] + s1);
+    s2 = s2 * (donor_k[2] + donor_ref[2]) / (donor_k[2] + s2);
     correction[base] = s0 * matrix[0] + s1 * matrix[3] + s2 * matrix[6];
     correction[base + 1u] = s0 * matrix[1] + s1 * matrix[4] + s2 * matrix[7];
     correction[base + 2u] = s0 * matrix[2] + s1 * matrix[5] + s2 * matrix[8];
@@ -1720,6 +1725,8 @@ impl CudaBackend {
             .flat_map(|r| r.iter().copied())
             .collect();
         let matrix_dev = self.stream.clone_htod(&matrix)?;
+        let donor_k = self.stream.clone_htod(&dp.donor_k)?;
+        let donor_ref = self.stream.clone_htod(&dp.donor_ref)?;
         let mut correction = self.alloc_f32(n_pixels as usize * 3)?;
         {
             let positive = if dp.is_positive { 1u32 } else { 0u32 };
@@ -1731,6 +1738,8 @@ impl CudaBackend {
                 .arg(&dp.density_max[0])
                 .arg(&dp.density_max[1])
                 .arg(&dp.density_max[2])
+                .arg(&donor_k)
+                .arg(&donor_ref)
                 .arg(&matrix_dev)
                 .arg(&mut correction);
             unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;

@@ -190,12 +190,34 @@ pub struct GrainParams {
     pub active: bool,
     #[serde(default = "default_true")]
     pub sublayers_active: bool,
+    /// Python's 48 µm-aperture RMS granularity. When present, the pipeline
+    /// sizes particle areas from the film's sampled sub-layer curves.
+    #[serde(default)]
+    pub rms_granularity: Option<[f64; 3]>,
+    /// Grain model: "layered" (default), "rms", or "monte_carlo".
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_one_f64")]
+    pub synthesis_amount: f64,
+    #[serde(default = "default_16u32")]
+    pub synthesis_samples: u32,
+    #[serde(default = "default_06_f64")]
+    pub synthesis_mean_radius_um: f64,
+    #[serde(default = "default_04_f64")]
+    pub synthesis_radius_stddev_ratio: f64,
+    #[serde(default = "default_4_f64")]
+    pub synthesis_cell_size_ratio: f64,
+    #[serde(default = "default_32u32")]
+    pub synthesis_max_grains_per_cell: u32,
     // f64 to preserve Python JSON precision through the Poisson/Binomial
     // RNG pipeline — the f32 truncation of these values shifts the
     // Poisson lambda by ~5e-8 and produces a different RNG stream.
     #[serde(default = "default_02_f64")]
     pub agx_particle_area_um2: f64,
-    #[serde(default = "default_particle_scale_f64")]
+    #[serde(
+        default = "default_particle_scale_f64",
+        alias = "particle_scale_sublayers"
+    )]
     pub agx_particle_scale: [f64; 3],
     #[serde(default = "default_particle_scale_layers_f64")]
     pub agx_particle_scale_layers: [f64; 3],
@@ -207,10 +229,14 @@ pub struct GrainParams {
     pub blur: f32,
     #[serde(default = "default_one")]
     pub blur_dye_clouds_um: f32,
-    #[serde(default = "default_micro_structure")]
-    pub micro_structure: [f32; 2],
+    #[serde(default = "default_micro_structure_f64")]
+    pub micro_structure: [f64; 2],
     #[serde(default = "default_1i")]
     pub n_sub_layers: u32,
+    #[serde(default)]
+    pub mult_usm_sigma: f64,
+    #[serde(default)]
+    pub mult_usm_amount: f64,
     /// One shared noise field across all channels instead of independent
     /// per-channel RNG streams. Set by the pipeline for B&W films
     /// (upstream n_channels==1 has a single emulsion); not user-facing.
@@ -221,6 +247,11 @@ pub struct GrainParams {
 fn default_02_f64() -> f64 {
     0.2
 }
+fn default_06_f64() -> f64 { 0.6 }
+fn default_04_f64() -> f64 { 0.4 }
+fn default_4_f64() -> f64 { 4.0 }
+fn default_16u32() -> u32 { 16 }
+fn default_32u32() -> u32 { 32 }
 fn default_particle_scale_f64() -> [f64; 3] {
     [1.6, 1.6, 3.2]
 }
@@ -239,6 +270,14 @@ impl Default for GrainParams {
         Self {
             active: true,
             sublayers_active: true,
+            rms_granularity: None,
+            model: "layered".to_string(),
+            synthesis_amount: 1.0,
+            synthesis_samples: 16,
+            synthesis_mean_radius_um: 0.6,
+            synthesis_radius_stddev_ratio: 0.4,
+            synthesis_cell_size_ratio: 4.0,
+            synthesis_max_grains_per_cell: 32,
             agx_particle_area_um2: 0.2,
             agx_particle_scale: [1.6, 1.6, 3.2],
             agx_particle_scale_layers: [2.0, 1.0, 0.5],
@@ -248,6 +287,8 @@ impl Default for GrainParams {
             blur_dye_clouds_um: 1.0,
             micro_structure: [0.2, 30.0],
             n_sub_layers: 1,
+            mult_usm_sigma: 0.0,
+            mult_usm_amount: 0.0,
             monochrome: false,
         }
     }
@@ -366,6 +407,17 @@ pub struct DirCouplersParams {
     pub diffusion_tail_um: f64,
     #[serde(default = "default_006_f64")]
     pub diffusion_tail_weight: f64,
+    /// Python parity: Langmuir donor knee as a fraction of each channel's
+    /// density ceiling. `1.0` matches the Python default.
+    #[serde(default = "default_langmuir_k_rgb")]
+    pub langmuir_donor_k_rgb: [f64; 3],
+    /// Python parity: receiver-side Langmuir knee for positive/reversal film.
+    #[serde(default = "default_langmuir_k_rgb")]
+    pub langmuir_receiver_k_rgb: [f64; 3],
+}
+
+fn default_langmuir_k_rgb() -> [f64; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 fn default_gamma_same_f64() -> [f64; 3] {
@@ -404,6 +456,8 @@ impl Default for DirCouplersParams {
             diffusion_size_um: 20.0,
             diffusion_tail_um: 200.0,
             diffusion_tail_weight: 0.06,
+            langmuir_donor_k_rgb: [1.0, 1.0, 1.0],
+            langmuir_receiver_k_rgb: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -540,6 +594,8 @@ pub struct IoParams {
     pub output_color_space: String,
     #[serde(default = "default_true")]
     pub output_cctf_encoding: bool,
+    #[serde(default = "default_auto_levels")]
+    pub auto_levels: String,
     #[serde(default)]
     pub crop: bool,
     #[serde(default = "default_crop_center")]
@@ -563,6 +619,7 @@ impl Default for IoParams {
             input_cctf_decoding: false,
             output_color_space: "sRGB".into(),
             output_cctf_encoding: true,
+            auto_levels: "Off".into(),
             crop: false,
             crop_center: [0.5, 0.5],
             crop_size: [0.1, 0.1],
@@ -701,6 +758,14 @@ pub struct RuntimeParams {
     pub io: IoParams,
     #[serde(default)]
     pub settings: SettingsParams,
+    #[serde(default)]
+    pub debug: DebugParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DebugParams {
+    #[serde(default)]
+    pub deactivate_stochastic_effects: bool,
 }
 
 impl Default for RuntimeParams {
@@ -713,6 +778,7 @@ impl Default for RuntimeParams {
             print_render: PrintRenderingParams::default(),
             io: IoParams::default(),
             settings: SettingsParams::default(),
+            debug: DebugParams::default(),
         }
     }
 }
@@ -778,7 +844,7 @@ fn default_uniformity() -> [f32; 3] {
 fn default_065() -> f32 {
     0.65
 }
-fn default_micro_structure() -> [f32; 2] {
+fn default_micro_structure_f64() -> [f64; 2] {
     [0.2, 30.0]
 }
 fn default_1i() -> u32 {
@@ -841,11 +907,59 @@ fn default_prophoto() -> String {
 fn default_srgb() -> String {
     "sRGB".into()
 }
+fn default_auto_levels() -> String {
+    "Off".into()
+}
 fn default_crop_center() -> [f32; 2] {
     [0.5, 0.5]
 }
 fn default_crop_size() -> [f32; 2] {
     [0.1, 0.1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeParams;
+
+    #[test]
+    fn python_grain_settings_deserialize_into_rust_grain_model() {
+        let params: RuntimeParams = serde_json::from_str(
+            r#"{
+                "film_render": {
+                    "grain": {
+                        "active": true,
+                        "rms_granularity": [6.0, 6.0, 6.0],
+                        "density_min": [0.03, 0.03, 0.03],
+                        "uniformity": [0.97, 0.97, 0.97],
+                        "particle_scale_sublayers": [1.0, 0.4, 0.25],
+                        "blur": 0.8,
+                        "mult_usm_sigma": 0.7,
+                        "mult_usm_amount": 1.5,
+                        "blur_dye_clouds_um": 2.0,
+                        "micro_structure": [0.2, 30.0]
+                    }
+                },
+                "io": {
+                    "output_color_space": "ProPhoto RGB",
+                    "auto_levels": "Per Channel Contrast with Snap Neutral Midtones"
+                }
+            }"#,
+        )
+        .unwrap();
+        let grain = params.film_render.grain;
+        assert_eq!(
+            params.io.auto_levels,
+            "Per Channel Contrast with Snap Neutral Midtones"
+        );
+        assert_eq!(params.io.output_color_space, "ProPhoto RGB");
+        assert_eq!(grain.rms_granularity, Some([6.0; 3]));
+        assert_eq!(grain.agx_particle_scale, [1.0, 0.4, 0.25]);
+        assert_eq!(grain.density_min, [0.03; 3]);
+        assert_eq!(grain.uniformity, [0.97; 3]);
+        assert_eq!(grain.mult_usm_sigma, 0.7);
+        assert_eq!(grain.mult_usm_amount, 1.5);
+        assert_eq!(grain.blur_dye_clouds_um, 2.0);
+    }
 }
 fn default_hanatos() -> String {
     "hanatos2025".into()

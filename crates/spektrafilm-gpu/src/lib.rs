@@ -290,6 +290,8 @@ pub struct DirCouplersGpuParams<'a> {
     /// Per-channel max density from the normalized curves (used only when
     /// `is_positive` is true; ignored otherwise).
     pub density_max: [f32; 3],
+    pub donor_k: [f32; 3],
+    pub donor_ref: [f32; 3],
     pub is_positive: bool,
     pub diffusion_size_px: f32,
     pub diffusion_tail_px: f32,

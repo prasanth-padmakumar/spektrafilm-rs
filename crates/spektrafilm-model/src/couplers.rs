@@ -3,10 +3,8 @@
 
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{from_f32, from_f64};
+use spektrafilm_math::precision::from_f64;
 use rayon::prelude::*;
-
-use crate::density_curves::normalize_density_curves;
 
 /// DIR couplers matrix [3][3]. Row = donor layer, Column = receiver layer.
 pub fn compute_dir_couplers_matrix(
@@ -45,6 +43,8 @@ pub fn compute_exposure_correction(
     diffusion_tail_weight: f64,
     positive: bool,
     backend: &dyn ComputeBackend,
+    donor_k: [f64; 3],
+    donor_ref: [f64; 3],
 ) -> ImageBuf {
     let mut density_silver = density_cmy.clone();
 
@@ -80,15 +80,41 @@ pub fn compute_exposure_correction(
         ],
     ];
     let mut correction = ImageBuf::new(log_raw.width, log_raw.height);
-    correction
+    let mut donor_image = ImageBuf::new(log_raw.width, log_raw.height);
+    donor_image
         .data
         .par_chunks_exact_mut(3)
         .zip(density_silver.data.par_chunks_exact(3))
         .for_each(|(out, px)| {
-            for m in 0..3 {
-                out[m] = px[0] * cm[0][m] + px[1] * cm[1][m] + px[2] * cm[2][m];
+            for c in 0..3 {
+                out[c] = px[c] * from_f64(donor_k[c] + donor_ref[c])
+                    / (from_f64(donor_k[c]) + px[c]);
             }
         });
+    correction
+        .data
+        .par_chunks_exact_mut(3)
+        .zip(donor_image.data.par_chunks_exact(3))
+        .for_each(|(out, donor_px)| {
+            for m in 0..3 {
+                out[m] = 0.0.into();
+            }
+            for c in 0..3 {
+                for m in 0..3 {
+                    // Match Python's einsum('ijk,km->ijm', donor, matrix):
+                    // donor channel c is multiplied by matrix[c][m].
+                    out[m] += donor_px[c] * cm[c][m];
+                }
+            }
+        });
+    tracing::info!(
+        matrix = ?couplers_matrix,
+        donor_k = ?donor_k,
+        donor_ref = ?donor_ref,
+        donor_first = ?donor_image.data.get(0..3).map(|px| [px[0] as f64, px[1] as f64, px[2] as f64]),
+        correction_first = ?correction.data.get(0..3).map(|px| [px[0] as f64, px[1] as f64, px[2] as f64]),
+        "DIR CPU f64 matrix diagnostic"
+    );
 
     if diffusion_size_pixel > 0.0 {
         // Python: `(1 - w) * fast_gaussian_filter(corr, σ_size)
@@ -132,16 +158,17 @@ pub fn apply_density_correction(
     density_cmy: &ImageBuf,
     log_raw: &ImageBuf,
     pixel_size_um: f32,
-    log_exposure: &[f32],
-    density_curves: &[[f32; 3]],
+    log_exposure: &[f64],
+    density_curves: &[[f64; 3]],
     couplers_matrix: &[[f64; 3]; 3],
     amount: f64,
     diffusion_size_um: f64,
     diffusion_tail_um: f64,
     diffusion_tail_weight: f64,
     positive: bool,
-    gamma_factor: f32,
+    gamma_factor: f64,
     backend: &dyn ComputeBackend,
+    langmuir_donor_k_rgb: [f64; 3],
 ) -> ImageBuf {
     let mut matrix_scaled = *couplers_matrix;
     for row in &mut matrix_scaled {
@@ -150,35 +177,66 @@ pub fn apply_density_correction(
         }
     }
 
-    // Compute density curves before DIR couplers — still uses f32
-    // density_curves from the profile because that's how the curves
-    // come in; we promote to f64 just for the matrix coupling.
-    let norm_curves = normalize_density_curves(density_curves);
-    let matrix_scaled_f32: [[f32; 3]; 3] = [
-        [
-            matrix_scaled[0][0] as f32,
-            matrix_scaled[0][1] as f32,
-            matrix_scaled[0][2] as f32,
-        ],
-        [
-            matrix_scaled[1][0] as f32,
-            matrix_scaled[1][1] as f32,
-            matrix_scaled[1][2] as f32,
-        ],
-        [
-            matrix_scaled[2][0] as f32,
-            matrix_scaled[2][1] as f32,
-            matrix_scaled[2][2] as f32,
-        ],
+    let mut norm_curves = density_curves.to_vec();
+    let mins = [
+        norm_curves.iter().map(|r| r[0]).fold(f64::INFINITY, f64::min),
+        norm_curves.iter().map(|r| r[1]).fold(f64::INFINITY, f64::min),
+        norm_curves.iter().map(|r| r[2]).fold(f64::INFINITY, f64::min),
     ];
-    let density_curves_0 =
-        compute_curves_before_dir(&norm_curves, log_exposure, &matrix_scaled_f32, positive);
-    let density_max_f32 = crate::density_curves::max_density(&norm_curves);
+    for row in &mut norm_curves { for c in 0..3 { row[c] -= mins[c]; } }
     let density_max = [
-        density_max_f32[0] as f64,
-        density_max_f32[1] as f64,
-        density_max_f32[2] as f64,
+        norm_curves.iter().map(|r| r[0]).fold(0.0, f64::max),
+        norm_curves.iter().map(|r| r[1]).fold(0.0, f64::max),
+        norm_curves.iter().map(|r| r[2]).fold(0.0, f64::max),
     ];
+    let donor_k = [langmuir_donor_k_rgb[0] * density_max[0], langmuir_donor_k_rgb[1] * density_max[1], langmuir_donor_k_rgb[2] * density_max[2]];
+    let donor_ref = [density_max[0] * 0.5, density_max[1] * 0.5, density_max[2] * 0.5];
+    let curve_count = norm_curves.len();
+    let curve_min = [
+        norm_curves
+            .iter()
+            .map(|row| row[0])
+            .fold(f64::INFINITY, f64::min),
+        norm_curves
+            .iter()
+            .map(|row| row[1])
+            .fold(f64::INFINITY, f64::min),
+        norm_curves
+            .iter()
+            .map(|row| row[2])
+            .fold(f64::INFINITY, f64::min),
+    ];
+    let sample_indices: Vec<usize> = if curve_count == 0 {
+        Vec::new()
+    } else {
+        [
+            0,
+            curve_count / 4,
+            curve_count / 2,
+            (3 * curve_count) / 4,
+            curve_count - 1,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+    };
+    let curve_samples: Vec<[f64; 3]> = sample_indices
+        .iter()
+        .map(|&index| norm_curves[index])
+        .collect();
+    tracing::info!(
+        curve_count,
+        curve_min = ?curve_min,
+        curve_max = ?density_max,
+        curve_sample_indices = ?sample_indices,
+        curve_samples = ?curve_samples,
+        density_max = ?density_max,
+        donor_k = ?donor_k,
+        donor_ref = ?donor_ref,
+        "DIR normalized density curve diagnostics"
+    );
+    let density_curves_0 = compute_curves_before_dir(&norm_curves, log_exposure, &matrix_scaled, positive, donor_k, donor_ref);
 
     let diffusion_size_px = (diffusion_size_um / pixel_size_um as f64) as f32;
     let diffusion_tail_px = (diffusion_tail_um / pixel_size_um as f64) as f32;
@@ -193,42 +251,50 @@ pub fn apply_density_correction(
         diffusion_tail_weight,
         positive,
         backend,
+        donor_k,
+        donor_ref,
     );
 
-    let log_exposure_f64: Vec<f64> = log_exposure.iter().map(|&v| v as f64).collect();
-    let density_curves_0_f64: Vec<[f64; 3]> = density_curves_0
-        .iter()
-        .map(|row| [row[0] as f64, row[1] as f64, row[2] as f64])
-        .collect();
     backend.density_curve_interp(
         &log_raw_corrected,
-        &log_exposure_f64,
-        &density_curves_0_f64,
-        gamma_factor as f64,
+        log_exposure,
+        &density_curves_0,
+        gamma_factor,
     )
 }
 
 /// Compute density curves before DIR coupler effects.
 pub fn compute_curves_before_dir(
-    density_curves: &[[f32; 3]],
-    log_exposure: &[f32],
-    couplers_matrix: &[[f32; 3]; 3],
+    density_curves: &[[f64; 3]],
+    log_exposure: &[f64],
+    couplers_matrix: &[[f64; 3]; 3],
     positive: bool,
-) -> Vec<[f32; 3]> {
+    donor_k: [f64; 3],
+    donor_ref: [f64; 3],
+) -> Vec<[f64; 3]> {
     let k = density_curves.len();
     let mut dc_silver = density_curves.to_vec();
 
     if positive {
-        let max_d = crate::density_curves::max_density(density_curves);
+        let max_d = [
+            density_curves.iter().map(|r| r[0]).fold(0.0, f64::max),
+            density_curves.iter().map(|r| r[1]).fold(0.0, f64::max),
+            density_curves.iter().map(|r| r[2]).fold(0.0, f64::max),
+        ];
         for row in &mut dc_silver {
             for c in 0..3 {
                 row[c] = max_d[c] - row[c];
             }
         }
     }
+    for row in &mut dc_silver {
+        for c in 0..3 {
+            row[c] = row[c] * (donor_k[c] + donor_ref[c]) / (donor_k[c] + row[c]);
+        }
+    }
 
     // couplers_amount = dc_silver @ couplers_matrix
-    let mut couplers_amount = vec![[0.0f32; 3]; k];
+    let mut couplers_amount = vec![[0.0f64; 3]; k];
     for j in 0..k {
         for m in 0..3 {
             couplers_amount[j][m] = dc_silver[j][0] * couplers_matrix[0][m]
@@ -239,17 +305,28 @@ pub fn compute_curves_before_dir(
 
     // log_exposure_0 = log_exposure - couplers_amount
     // Then re-interpolate density curves on the shifted axis
-    let mut corrected = vec![[0.0f32; 3]; k];
+    let mut corrected = vec![[0.0f64; 3]; k];
     for c in 0..3 {
-        let le_shifted: Vec<f32> = (0..k)
+        let le_shifted: Vec<f64> = (0..k)
             .map(|j| log_exposure[j] - couplers_amount[j][c])
             .collect();
-        let dc_col: Vec<f32> = density_curves.iter().map(|row| row[c]).collect();
+        let dc_col: Vec<f64> = density_curves.iter().map(|row| row[c]).collect();
         for j in 0..k {
             corrected[j][c] =
-                spektrafilm_math::interp::interp_1d(&le_shifted, &dc_col, log_exposure[j]);
+                interp_1d_f64(&le_shifted, &dc_col, log_exposure[j]);
         }
     }
 
     corrected
+}
+
+fn interp_1d_f64(x: &[f64], y: &[f64], xq: f64) -> f64 {
+    if x.is_empty() { return 0.0; }
+    if xq <= x[0] { return y[0]; }
+    if xq >= x[x.len() - 1] { return y[y.len() - 1]; }
+    let mut hi = x.partition_point(|&v| v < xq);
+    if hi == 0 { hi = 1; }
+    let lo = hi - 1;
+    let span = x[hi] - x[lo];
+    if span == 0.0 { y[lo] } else { y[lo] + (y[hi] - y[lo]) * (xq - x[lo]) / span }
 }
