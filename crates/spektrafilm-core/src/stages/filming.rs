@@ -17,6 +17,10 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
     film_format_mm * 1000.0 / width.max(height) as f32
 }
 
+pub fn pixel_size_um_f64(film_format_mm: f32, width: u32, height: u32) -> f64 {
+    film_format_mm as f64 * 1000.0 / width.max(height) as f64
+}
+
 /// Auto-exposure compensation, Python-compatible
 /// (`spektrafilm/utils/autoexposure.py`).
 ///
@@ -509,7 +513,7 @@ pub fn expose(
     if halation.active {
         raw = spektrafilm_model::diffusion::apply_halation_um(
             &raw,
-            pix_um,
+            pixel_size_um_f64(params.camera.film_format_mm, image.width, image.height),
             halation.scatter_amount,
             halation.scatter_spatial_scale,
             halation.scatter_core_um,
@@ -615,6 +619,7 @@ pub fn develop(
                 grain.synthesis_amount, grain.synthesis_samples,
                 grain.synthesis_mean_radius_um, grain.synthesis_radius_stddev_ratio,
                 grain.synthesis_cell_size_ratio, grain.synthesis_max_grains_per_cell,
+                grain.synthesis_layered, grain.synthesis_layer_scale,
                 grain.monochrome, backend,
             );
         } else if let Some(rms_granularity) = grain.rms_granularity {

@@ -1,3 +1,7 @@
+use crate::image::ImageBuf;
+use crate::precision::from_f64;
+use rayon::prelude::*;
+
 /// Trilinear 3D LUT interpolation.
 ///
 /// `data`: flat RGB data, size^3 * 3 floats, indexed as data[(r*size*size + g*size + b)*3 + c].
@@ -51,6 +55,102 @@ pub fn trilinear_3d(data: &[f32], size: usize, r: f32, g: f32, b: f32) -> [f32; 
         out[c] = c0 + fb * (c1 - c0);
     }
     out
+}
+
+/// Tetrahedral 3D LUT interpolation on f64 data.
+///
+/// `r`, `g`, and `b` are LUT-grid coordinates in `[0, size - 1]`. The
+/// tetrahedron selection and interpolation order match Python's
+/// `apply_lut_tetrahedral_3d`.
+#[inline]
+pub fn tetrahedral_3d_f64(data: &[f64], size: usize, r: f64, g: f64, b: f64) -> [f64; 3] {
+    assert!(size >= 2, "tetrahedral LUT size must be at least 2");
+    assert_eq!(data.len(), size * size * size * 3);
+
+    let coordinate = |value: f64| {
+        let clamped = value.clamp(0.0, (size - 1) as f64);
+        let base = if clamped >= (size - 1) as f64 {
+            size - 2
+        } else {
+            clamped.floor() as usize
+        };
+        (base, clamped - base as f64)
+    };
+    let (i, fr) = coordinate(r);
+    let (j, fg) = coordinate(g);
+    let (k, fb) = coordinate(b);
+    let index = |ri: usize, gi: usize, bi: usize, channel: usize| {
+        data[((ri * size + gi) * size + bi) * 3 + channel]
+    };
+
+    let mut out = [0.0; 3];
+    for (channel, value) in out.iter_mut().enumerate() {
+        let c000 = index(i, j, k, channel);
+        let c111 = index(i + 1, j + 1, k + 1, channel);
+        *value = if fr > fg {
+            if fg > fb {
+                let c100 = index(i + 1, j, k, channel);
+                let c110 = index(i + 1, j + 1, k, channel);
+                c000 + fr * (c100 - c000) + fg * (c110 - c100) + fb * (c111 - c110)
+            } else if fr > fb {
+                let c100 = index(i + 1, j, k, channel);
+                let c101 = index(i + 1, j, k + 1, channel);
+                c000 + fr * (c100 - c000) + fb * (c101 - c100) + fg * (c111 - c101)
+            } else {
+                let c001 = index(i, j, k + 1, channel);
+                let c101 = index(i + 1, j, k + 1, channel);
+                c000 + fb * (c001 - c000) + fr * (c101 - c001) + fg * (c111 - c101)
+            }
+        } else if fb > fg {
+            let c001 = index(i, j, k + 1, channel);
+            let c011 = index(i, j + 1, k + 1, channel);
+            c000 + fb * (c001 - c000) + fg * (c011 - c001) + fr * (c111 - c011)
+        } else if fb > fr {
+            let c010 = index(i, j + 1, k, channel);
+            let c011 = index(i, j + 1, k + 1, channel);
+            c000 + fg * (c010 - c000) + fb * (c011 - c010) + fr * (c111 - c011)
+        } else {
+            let c010 = index(i, j + 1, k, channel);
+            let c110 = index(i + 1, j + 1, k, channel);
+            c000 + fg * (c010 - c000) + fr * (c110 - c010) + fb * (c111 - c110)
+        };
+    }
+    out
+}
+
+/// Apply an f64 tetrahedral LUT to an image whose channel values use
+/// independent input bounds.
+pub fn apply_tetrahedral_3d_f64(
+    image: &ImageBuf,
+    data: &[f64],
+    size: usize,
+    data_min: [f64; 3],
+    data_max: [f64; 3],
+) -> ImageBuf {
+    let scale = (size - 1) as f64;
+    let inverse_range = [
+        scale / (data_max[0] - data_min[0]),
+        scale / (data_max[1] - data_min[1]),
+        scale / (data_max[2] - data_min[2]),
+    ];
+    let mut output = image.clone();
+    output
+        .data
+        .par_chunks_exact_mut(3)
+        .zip(image.data.par_chunks_exact(3))
+        .for_each(|(dst, src)| {
+            let coordinates = [
+                (src[0] as f64 - data_min[0]) * inverse_range[0],
+                (src[1] as f64 - data_min[1]) * inverse_range[1],
+                (src[2] as f64 - data_min[2]) * inverse_range[2],
+            ];
+            let rgb =
+                tetrahedral_3d_f64(data, size, coordinates[0], coordinates[1], coordinates[2]);
+            dst[0] = from_f64(rgb[0]);
+            dst[1] = from_f64(rgb[1]);
+            dst[2] = from_f64(rgb[2]);
+        });
+    output
 }
 
 /// Mitchell-Netravali bicubic 2D interpolation on f64 data.
@@ -220,6 +320,74 @@ fn reflect_index(idx: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tetrahedral_3d_f64_preserves_linear_lut() {
+        let size = 3;
+        let mut data = vec![0.0; size * size * size * 3];
+        for r in 0..size {
+            for g in 0..size {
+                for b in 0..size {
+                    let base = ((r * size + g) * size + b) * 3;
+                    data[base] = r as f64 / 2.0;
+                    data[base + 1] = g as f64 / 2.0;
+                    data[base + 2] = b as f64 / 2.0;
+                }
+            }
+        }
+        for (r, g, b) in [
+            (0.2, 0.6, 0.9),
+            (0.9, 0.6, 0.2),
+            (2.0, 1.0, 0.0),
+            (-1.0, 0.5, 4.0),
+        ] {
+            let output = tetrahedral_3d_f64(&data, size, r, g, b);
+            let expected = [
+                r.clamp(0.0, 2.0) / 2.0,
+                g.clamp(0.0, 2.0) / 2.0,
+                b.clamp(0.0, 2.0) / 2.0,
+            ];
+            for channel in 0..3 {
+                assert!(
+                    (output[channel] - expected[channel]).abs() < 1e-12,
+                    "input=({r}, {g}, {b}), got {output:?}, expected {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tetrahedral_3d_f64_matches_python_vertex_ordering() {
+        let size = 2;
+        let mut data = vec![0.0; size * size * size * 3];
+        for r in 0..size {
+            for g in 0..size {
+                for b in 0..size {
+                    let f =
+                        (r + 2 * g + 4 * b + 8 * r * g + 16 * g * b + 32 * r * b + 64 * r * g * b)
+                            as f64;
+                    let base = ((r * size + g) * size + b) * 3;
+                    data[base] = f;
+                    data[base + 1] = 2.0 * f + 1.0;
+                    data[base + 2] = -f;
+                }
+            }
+        }
+        let cases = [
+            ((0.2, 0.6, 0.9), 35.4),
+            ((0.6, 0.2, 0.9), 41.4),
+            ((0.6, 0.9, 0.2), 30.4),
+            ((0.2, 0.9, 0.6), 34.8),
+            ((0.9, 0.2, 0.6), 40.5),
+            ((0.9, 0.6, 0.2), 30.1),
+        ];
+        for ((r, g, b), expected) in cases {
+            let output = tetrahedral_3d_f64(&data, size, r, g, b);
+            assert!((output[0] - expected).abs() < 1e-12);
+            assert!((output[1] - (2.0 * expected + 1.0)).abs() < 1e-12);
+            assert!((output[2] + expected).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn test_trilinear_corners() {

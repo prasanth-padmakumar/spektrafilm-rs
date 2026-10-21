@@ -250,13 +250,7 @@ pub fn enlarger_filtered_illuminant_f64(
         return ILLUMINANT_TH_KG3_DEFAULT_FILTERS_F64.to_vec();
     }
 
-    let light_source: Vec<f64> = match illuminant_name {
-        "TH-KG3" => ILLUMINANT_TH_KG3_F64.to_vec(),
-        "D50" => spectral::ILLUMINANT_D50_F64.to_vec(),
-        "D55" => spectral::ILLUMINANT_D55_F64.to_vec(),
-        "D65" => spectral::ILLUMINANT_D65_F64.to_vec(),
-        _ => ILLUMINANT_TH_KG3.iter().map(|&v| v as f64).collect(),
-    };
+    let light_source = standard_illuminant_f64(illuminant_name);
 
     let dichroics = dichroic_filters_f64();
     let filter_cc = [c_filter, m_filter, y_filter];
@@ -268,9 +262,7 @@ pub fn enlarger_filtered_illuminant_f64(
         10.0f64.powf(-filter_cc[2] / 100.0),
     ];
 
-    // Apply dichroic filters: for each CMY filter,
-    //   dimmed = 1 - (1 - dichroic) * (1 - transmittance_value)
-    //   combined = product of all 3 dimmed filters
+    // Apply dichroic filters for each wavelength.
     let mut filtered = vec![0.0f64; N_WAVELENGTHS];
     for i in 0..N_WAVELENGTHS {
         let mut total = 1.0f64;
@@ -282,6 +274,17 @@ pub fn enlarger_filtered_illuminant_f64(
     }
 
     filtered
+}
+
+/// Reference source illuminant spectrum before enlarger filters.
+pub fn standard_illuminant_f64(illuminant_name: &str) -> Vec<f64> {
+    match illuminant_name {
+        "TH-KG3" => ILLUMINANT_TH_KG3_F64.to_vec(),
+        "D50" => spectral::ILLUMINANT_D50_F64.to_vec(),
+        "D55" => spectral::ILLUMINANT_D55_F64.to_vec(),
+        "D65" => spectral::ILLUMINANT_D65_F64.to_vec(),
+        _ => ILLUMINANT_TH_KG3.iter().map(|&v| v as f64).collect(),
+    }
 }
 
 /// Spatially-constant raw 3-vector added to every print pixel's exposure

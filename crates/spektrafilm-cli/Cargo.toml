@@ -18,6 +18,7 @@ name = "decode_raw_gui"
 path = "src/bin/decode_raw_gui.rs"
 
 [features]
+default = ["precision-f64"]
 precision-f64 = [
     "spektrafilm-math/precision-f64",
     "spektrafilm-core/precision-f64",

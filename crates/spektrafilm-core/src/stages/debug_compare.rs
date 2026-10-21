@@ -298,11 +298,8 @@ mod tests {
         sign * (1.0 - poly * (-x * x).exp())
     }
 
-    /// Stage-by-stage parity against upstream 0.3.4 on a 1x1 linear 0.184
-    /// pixel at default settings (CAT16, input gamut `xy` baked into the
-    /// LUT, model-evaluated print curves), stochastic/spatial effects off.
-    /// Reference values are the upstream pipeline taps (`log_e_film`,
-    /// `cmy_film`, `log_e_print`, `cmy_print`) dumped from `origin/main`.
+    /// Stage-by-stage parity against the current Python runtime on a 1x1
+    /// linear 0.184 pixel at default settings, stochastic/spatial effects off.
     /// When full-chain parity breaks, this pinpoints the diverging stage.
     /// Note the final scan here bypasses output gamut compression (identity),
     /// so there is no `rgb_out` assertion — the full-chain test covers it.
@@ -375,9 +372,9 @@ mod tests {
             "cmy_film",
             density_cmy.get(0, 0),
             [
-                0.68987884029422741,
-                0.70272493086202847,
-                0.84508598425873571,
+                0.6862571200859212,
+                0.7023008152320968,
+                0.8435893418108885,
             ],
         );
 
@@ -396,9 +393,9 @@ mod tests {
             "log_e_print",
             log_raw_print.get(0, 0),
             [
-                -0.0058943653645049067,
-                0.0016183559749744021,
-                0.0019890502790478998,
+                -0.005219785352038343,
+                0.0021663267142133466,
+                0.0030549243375203794,
             ],
         );
 
@@ -412,9 +409,9 @@ mod tests {
             "cmy_print",
             density_print.get(0, 0),
             [
-                0.64189250593682268,
-                0.54211141885697389,
-                0.52002829327970834,
+                0.6434945914586329,
+                0.5432013580977535,
+                0.5221855790197598,
             ],
         );
     }

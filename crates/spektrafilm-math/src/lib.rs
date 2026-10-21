@@ -8,6 +8,7 @@ pub mod npy;
 pub mod numpy_rng;
 pub mod pchip3d;
 pub mod precision;
+pub mod progress;
 pub mod spectral;
 pub mod stats;
 pub mod vforce;

@@ -95,13 +95,11 @@ mod integration_tests {
         }
     }
 
-    /// Full default chain vs upstream 0.3.4 `simulate()` — the post-defaults
-    /// baseline (CAT16, input gamut `xy`, output gamut `cam16ucs`, and the
-    /// model-evaluated print curves are all active here). Reference values
-    /// dumped from upstream `origin/main` (= 0.3.4) with the stochastic /
-    /// spatial effects off and linear sRGB in/out.
+    /// Full default chain vs the current Python runtime (CAT16, input gamut
+    /// `xy`, output gamut `oklch`, and model-evaluated print curves active),
+    /// with stochastic/spatial effects off and linear sRGB in/out.
     #[test]
-    fn full_chain_matches_python_0_3_4_defaults() {
+    fn full_chain_matches_current_python_defaults() {
         let dir = data_dir();
         let film = profile::load_profile_by_name(&dir, "kodak_portra_400").unwrap();
         let print = profile::load_profile_by_name(&dir, "kodak_portra_endura").unwrap();
@@ -120,6 +118,11 @@ mod integration_tests {
         let backend = spektrafilm_gpu::cpu_backend::CpuBackend;
         let pipeline =
             Pipeline::new_with_spectral(film, print, params, &dir).expect("spectral LUT");
+        let dir = &pipeline.params.film_render.dir_couplers;
+        assert_eq!(dir.gamma_samelayer_rgb, [0.5159, 0.5934, 0.2829]);
+        assert_eq!(dir.gamma_interlayer_r_to_gb, [0.4032, 0.2488]);
+        assert_eq!(dir.gamma_interlayer_g_to_rb, [0.2227, 0.4340]);
+        assert_eq!(dir.gamma_interlayer_b_to_rg, [0.1829, 0.1799]);
 
         // The f32 Scalar chain carries ~1e-4 of accumulated rounding against
         // the f64 Python reference; the f64 build tracks it tightly.
@@ -131,11 +134,7 @@ mod integration_tests {
         // 1×1 midgray.
         let img = ImageBuf::from_data(1, 1, vec![from_f64(0.184); 3]);
         let out = pipeline.process(img, &backend);
-        let want = [
-            0.17518024973220059,
-            0.17883059767931708,
-            0.18934288118407094,
-        ];
+        let want = [0.17454335799238288, 0.1782320338764924, 0.1882841175220337];
         for c in 0..3 {
             let got = out.get(0, 0)[c] as f64;
             assert!(
@@ -155,22 +154,22 @@ mod integration_tests {
         let out = pipeline.process(img, &backend);
         #[rustfmt::skip]
         let want: [[f64; 3]; 16] = [
-            [0.030140578894842104, 0.10482173080681569, 0.16323263024872359],
-            [0.28284244086494625, 0.36230193922267084, 0.42928148064834676],
-            [0.3353451807767468, 0.076427614378209482, 0.13647407034435774],
-            [0.20879086264247579, 0.29459368653984946, 0.36196826709735686],
-            [0.40612358537107524, 0.34267145956453349, 0.098468693348025937],
-            [0.13020451874838482, 0.21646938505071839, 0.28562089684501552],
-            [0.36393816309250704, 0.43921581264848525, 0.49969437202741285],
-            [0.048658768968400892, 0.12737590764642162, 0.19018617795337284],
-            [0.30145661667996704, 0.37870527708934137, 0.44581696264428788],
-            [0.35937910731344802, 0.09909092393180377, 0.16141353541124179],
-            [0.22780229482543857, 0.31345554394629804, 0.37969407564677998],
-            [0.42292203106495652, 0.36564847210885171, 0.12172785269499363],
-            [0.15476048038036888, 0.23926341868289583, 0.30831655353252529],
-            [0.37946779125297414, 0.45406130948472612, 0.51171040229547315],
-            [0.068514332830799163, 0.1501539662811362, 0.21561362102769013],
-            [0.31940096432374643, 0.39473020737167158, 0.46156726106459162],
+            [0.027368679497772531, 0.10479515587162812, 0.16667524839200784],
+            [0.2867585324800544, 0.36406381821227468, 0.43042199961282501],
+            [0.33974926008702006, 0.075831126628287546, 0.13589063227932158],
+            [0.21298338658374757, 0.29387815139034679, 0.36382808694355123],
+            [0.41046428370967292, 0.34373589378631331, 0.097440405753419834],
+            [0.13222243196569225, 0.21459033248912482, 0.28519684880192064],
+            [0.36772278693509014, 0.43848745702216541, 0.49786653990156743],
+            [0.047490738567086514, 0.12815543540931973, 0.19366753592065233],
+            [0.30457371087436735, 0.38107237173720221, 0.44592874249043979],
+            [0.36245228909116933, 0.098027040876713961, 0.16004049787610858],
+            [0.23310927785485733, 0.31336116442377449, 0.382411240674907],
+            [0.42649591640324364, 0.36557967107646433, 0.12143683855664375],
+            [0.15419210396877897, 0.23656741311736196, 0.30700721554297888],
+            [0.3828290887766006, 0.45207419086445116, 0.5098076945539376],
+            [0.069509956491298611, 0.15152027674745416, 0.21929352858097845],
+            [0.32254452436232878, 0.39724805266723373, 0.46083283512339396],
         ];
         let mut max_diff = 0.0f64;
         for (i, want_px) in want.iter().enumerate() {
@@ -186,7 +185,7 @@ mod integration_tests {
                 );
             }
         }
-        eprintln!("full-chain 0.3.4 defaults: max diff vs Python {max_diff:.3e}");
+        eprintln!("full-chain current defaults: max diff vs Python {max_diff:.3e}");
     }
 
     #[test]
@@ -234,17 +233,37 @@ mod integration_tests {
         }
         let img = ImageBuf::from_data(64, 64, data);
 
-        let pipeline = Pipeline::new_with_spectral(film, print, params.clone(), &dir)
-            .unwrap()
-            .with_params(params);
+        let pipeline = Pipeline::new_with_spectral(film, print, params, &dir).unwrap();
+        let params = pipeline.params.clone();
+        let pipeline = pipeline.with_params(params);
+        assert_eq!(
+            pipeline.params.film_render.dir_couplers.gamma_samelayer_rgb,
+            [0.2291, 0.1029, 0.2651],
+            "GUI-style with_params must preserve positive-film DIR parameters"
+        );
         assert_eq!(
             pipeline
                 .params
                 .film_render
                 .dir_couplers
-                .gamma_samelayer_rgb,
-            [0.12, 0.08, 0.06],
-            "GUI-style with_params must preserve positive-film DIR parameters"
+                .gamma_interlayer_r_to_gb,
+            [0.1449, 0.1560]
+        );
+        assert_eq!(
+            pipeline
+                .params
+                .film_render
+                .dir_couplers
+                .gamma_interlayer_g_to_rb,
+            [0.0496, 0.0874]
+        );
+        assert_eq!(
+            pipeline
+                .params
+                .film_render
+                .dir_couplers
+                .gamma_interlayer_b_to_rg,
+            [0.0571, 0.2462]
         );
         let result = pipeline.process(img, &backend);
         let mut clipped_low = 0usize;

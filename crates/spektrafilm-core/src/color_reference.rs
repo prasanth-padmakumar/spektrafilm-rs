@@ -511,9 +511,8 @@ mod parity_tests {
 
     /// Print-path B&W correction regression guard. The luminance remap
     /// `(m, q)` and the printing-exposure correction were cross-checked
-    /// against a faithful transcription of Python's `color_reference.py`
-    /// (kodak_portra_400 → kodak_portra_endura); they agree to ~1e-7, the
-    /// residual being the f32 storage of the scanner white/black levels.
+    /// against Python's current `ColorReferenceService`
+    /// (kodak_portra_400 → kodak_portra_endura).
     #[test]
     fn print_bw_correction_matches_python() {
         let dir = data_dir();
@@ -538,15 +537,12 @@ mod parity_tests {
 
         assert!(cref.has_remap(), "print path must build a luminance remap");
         let (m, q) = cref.xyz_remap.unwrap();
-        // Reference values from upstream 0.3.4's color_reference.py print
-        // path (SimulationPipeline at default params, corrections on):
-        //   m = 1.1805080822518117
-        //   q = -3.99466139952556459e-3
-        //   printing_exposure_correction = 1.0644087236240962
-        assert!((m - 1.1805080822518117).abs() < 1e-6, "m = {m}");
-        assert!((q - -3.99466139952556459e-3).abs() < 1e-7, "q = {q}");
+        // Reference values from Python with model-derived print curves and
+        // matching neutral-filter data.
+        assert!((m - 1.1797286594567515).abs() < 1e-6, "m = {m}");
+        assert!((q - -0.004011410997033376).abs() < 1e-7, "q = {q}");
         assert!(
-            (cref.printing_exposure_correction - 1.0644087236240962).abs() < 1e-6,
+            (cref.printing_exposure_correction - 1.063670433995664).abs() < 1e-6,
             "printing_exposure_correction = {}",
             cref.printing_exposure_correction
         );

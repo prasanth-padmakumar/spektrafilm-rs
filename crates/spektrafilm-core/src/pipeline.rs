@@ -17,6 +17,55 @@ use crate::profile::Profile;
 use crate::spectral_service;
 use crate::stages;
 
+fn midgray_auto_exposure_scale(raw: [f64; 3], method: &str) -> f64 {
+    const METHODS: [&str; 8] = [
+        "average",
+        "median",
+        "center_weighted",
+        "partial",
+        "matrix",
+        "multi_zone",
+        "highlight_weighted",
+        "hybrid",
+    ];
+    if !METHODS.contains(&method) {
+        return 1.0;
+    }
+    let mean = (raw[0] + raw[1] + raw[2]) / 3.0;
+    if mean > 0.0 && mean.is_finite() {
+        (-mean.log2()).exp2()
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::midgray_auto_exposure_scale;
+
+    #[test]
+    fn midgray_auto_exposure_scale_meters_equal_raw_channels() {
+        let raw = [0.9, 1.0, 1.1];
+        let expected = 1.0 / ((raw[0] + raw[1] + raw[2]) / 3.0);
+        for method in [
+            "average",
+            "median",
+            "center_weighted",
+            "partial",
+            "matrix",
+            "multi_zone",
+            "highlight_weighted",
+            "hybrid",
+        ] {
+            assert!(
+                (midgray_auto_exposure_scale(raw, method) - expected).abs() < 1e-15,
+                "method {method}"
+            );
+        }
+        assert_eq!(midgray_auto_exposure_scale(raw, "unsupported"), 1.0);
+    }
+}
+
 fn apply_film_curve_chemistry(
     film: &mut Profile,
     chemistry: &FilmChemistryParams,
@@ -58,6 +107,86 @@ fn apply_film_curve_chemistry(
         Vec::new()
     };
     Ok(true)
+}
+
+fn refresh_print_density_curves(print: &mut Profile) -> Result<(), String> {
+    let Some(model) = print.data.density_curves_model.as_ref() else {
+        return Ok(());
+    };
+    let curves = crate::print_morph::morph_density_curves(
+        &print.log_exposure_f64(),
+        model,
+        &PrintCurvesMorphParams::default(),
+        print.is_positive(),
+    )?;
+    print.data.density_curves = curves
+        .into_iter()
+        .map(|row| row.into_iter().collect())
+        .collect();
+    Ok(())
+}
+
+fn apply_dir_coupler_presets(film: &Profile, params: &mut RuntimeParams) {
+    let dir = &mut params.film_render.dir_couplers;
+    let cine = !film.is_positive() && film.info.usage == "cine";
+    let defaults = match (film.is_positive(), cine) {
+        (true, _) => (
+            [0.2291, 0.1029, 0.2651],
+            [0.1449, 0.1560],
+            [0.0496, 0.0874],
+            [0.0571, 0.2462],
+        ),
+        (false, true) if film.info.reference_illuminant.to_uppercase().starts_with('T') => (
+            [0.4601, 0.4433, 0.4414],
+            [0.4313, 0.3157],
+            [0.3145, 0.3890],
+            [0.2423, 0.2506],
+        ),
+        (false, true) => (
+            [0.5456, 0.5434, 0.3766],
+            [0.4263, 0.2781],
+            [0.2051, 0.5015],
+            [0.2950, 0.2449],
+        ),
+        (false, false) => (
+            [0.5159, 0.5934, 0.2829],
+            [0.4032, 0.2488],
+            [0.2227, 0.4340],
+            [0.1829, 0.1799],
+        ),
+    };
+    dir.gamma_samelayer_rgb = defaults.0;
+    dir.gamma_interlayer_r_to_gb = defaults.1;
+    dir.gamma_interlayer_g_to_rb = defaults.2;
+    dir.gamma_interlayer_b_to_rg = defaults.3;
+
+    let stock_preset = match film.info.stock.as_deref() {
+        Some("fujifilm_velvia_100") => Some((
+            [0.2398, 0.0662, 0.1440],
+            [0.0707, 0.2367],
+            [0.0119, 0.0380],
+            [0.0111, 0.1413],
+        )),
+        Some("kodak_kodachrome_64") => Some((
+            [0.2942, 0.0841, 0.2492],
+            [0.1699, 0.2188],
+            [0.0625, 0.0692],
+            [0.1153, 0.2359],
+        )),
+        Some("fujifilm_provia_100f") => Some((
+            [0.2786, 0.1257, 0.3480],
+            [0.1448, 0.2003],
+            [0.0516, 0.1250],
+            [0.0518, 0.3089],
+        )),
+        _ => None,
+    };
+    if let Some((same, r_to_gb, g_to_rb, b_to_rg)) = stock_preset {
+        dir.gamma_samelayer_rgb = same;
+        dir.gamma_interlayer_r_to_gb = r_to_gb;
+        dir.gamma_interlayer_g_to_rb = g_to_rb;
+        dir.gamma_interlayer_b_to_rg = b_to_rg;
+    }
 }
 
 fn apply_film_specific_params(film: &Profile, params: &mut RuntimeParams) {
@@ -115,6 +244,28 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    fn halation_requires_cpu(&self) -> bool {
+        let halation = &self.params.film_render.halation;
+        if !halation.active {
+            return false;
+        }
+        let scatter_active = halation.scatter_amount > 0.0
+            && halation.scatter_spatial_scale > 0.0
+            && (0..3).any(|channel| {
+                let weight = halation.scatter_tail_weight[channel];
+                (weight != 1.0 && halation.scatter_core_um[channel] > 0.0)
+                    || (weight != 0.0 && halation.scatter_tail_um[channel] > 0.0)
+            });
+        let back_reflection_active = halation.halation_n_bounces > 0
+            && halation.halation_amount != 0.0
+            && halation.halation_spatial_scale > 0.0
+            && (0..3).any(|channel| {
+                halation.halation_strength[channel] != 0.0
+                    && halation.halation_first_sigma_um[channel] > 0.0
+            });
+        scatter_active || back_reflection_active
+    }
+
     /// Accessor for the pre-computed TC LUT (used by parity tests).
     pub fn tc_lut(&self) -> Option<&TcLut> {
         self.tc_lut.as_ref()
@@ -130,6 +281,189 @@ impl Pipeline {
     /// Accessor for the constant preflash raw vector (parity tests / debug).
     pub fn preflash_raw(&self) -> [f64; 3] {
         self.preflash_raw
+    }
+
+    /// Compact calibration inputs and results for paired Python/Rust scans.
+    /// This is only called by the diagnostics-enabled CLI and does not alter
+    /// the render path.
+    pub fn diagnostics_calibration(&self) -> serde_json::Value {
+        let gray_scale = |scale: f64| {
+            if let Some(lut) = &self.tc_lut {
+                crate::enlarger::midgray_raw_hanatos(
+                    lut,
+                    select_illuminant(&self.front_illuminant),
+                    self.params.settings.use_cat16,
+                    scale,
+                )
+            } else if let Some(core) = &self.mallett_core {
+                let matrix = crate::mallett::film_matrix(core, "sRGB");
+                let gray = 0.184 * scale;
+                crate::mallett::apply(&matrix, [gray, gray, gray])
+            } else {
+                [0.0; 3]
+            }
+        };
+        let raw = gray_scale(1.0);
+        let auto_scale = if self.params.camera.auto_exposure {
+            midgray_auto_exposure_scale(raw, &self.params.camera.auto_exposure_method)
+        } else {
+            1.0
+        };
+        let auto_ev = auto_scale.log2();
+        let scaled_raw = raw.map(|value| value * auto_scale);
+        let density_unscaled =
+            crate::enlarger::midgray_density_spectral_from_raw(raw, &self.film, &self.params);
+        let density_spectral = crate::enlarger::midgray_density_spectral_from_raw(
+            scaled_raw,
+            &self.film,
+            &self.params,
+        );
+        let compensated_raw_unscaled =
+            gray_scale(2.0f64.powf(self.params.camera.exposure_compensation_ev as f64));
+        let compensated_raw = compensated_raw_unscaled.map(|value| value * auto_scale);
+        let compensated_density_unscaled = crate::enlarger::midgray_density_spectral_from_raw(
+            compensated_raw_unscaled,
+            &self.film,
+            &self.params,
+        );
+        let compensated_density = crate::enlarger::midgray_density_spectral_from_raw(
+            compensated_raw,
+            &self.film,
+            &self.params,
+        );
+        let sensitivity: Vec<[f64; 3]> = self
+            .print
+            .log_sensitivity_f64()
+            .iter()
+            .map(|row| {
+                row.map(|value| {
+                    let sensitivity = 10.0f64.powf(value);
+                    if sensitivity.is_nan() { 0.0 } else { sensitivity }
+                })
+            })
+            .collect();
+        let channel_raw = |density: &[f64]| -> [f64; 3] {
+            let n = density
+                .len()
+                .min(self.print_illuminant.len())
+                .min(sensitivity.len());
+            std::array::from_fn(|channel| {
+                let terms: Vec<f64> = (0..n)
+                    .map(|wl| {
+                        10.0f64.powf(-density[wl])
+                            * self.print_illuminant[wl]
+                            * sensitivity[wl][channel]
+                    })
+                    .collect();
+                crate::spectral_service::pairwise_sum_f64_pub(&terms)
+            })
+        };
+        let factor_midgray = crate::enlarger::compute_exposure_factor(
+            &density_unscaled,
+            &self.print_illuminant,
+            &sensitivity,
+        );
+        let factor_midgray_comp = crate::enlarger::compute_exposure_factor(
+            &compensated_density_unscaled,
+            &self.print_illuminant,
+            &sensitivity,
+        );
+        let factor_midgray_autoexposed = crate::enlarger::compute_exposure_factor(
+            &density_spectral,
+            &self.print_illuminant,
+            &sensitivity,
+        );
+        let factor_midgray_comp_autoexposed = crate::enlarger::compute_exposure_factor(
+            &compensated_density,
+            &self.print_illuminant,
+            &sensitivity,
+        );
+        let color_ref = crate::color_reference::ColorReference::compute(
+            &self.film,
+            &self.print,
+            &self.params,
+            &self.print_illuminant,
+            self.print_exposure_factor,
+        );
+        let non_finite_count = |values: &[f64]| values.iter().filter(|value| !value.is_finite()).count();
+        let film_channel_density: Vec<f64> = self
+            .film
+            .data
+            .channel_density
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let wavelength_count = self.print_illuminant.len();
+        let wavelengths_nm: Vec<f64> = (0..wavelength_count)
+            .map(|index| {
+                spektrafilm_math::spectral::WAVELENGTH_MIN as f64
+                    + index as f64 * spektrafilm_math::spectral::WAVELENGTH_STEP as f64
+            })
+            .collect();
+        serde_json::json!({
+            "midgray": {
+                "rgb": [0.184, 0.184, 0.184],
+                "raw_before_autoexposure": raw,
+                "auto_exposure_method": self.params.camera.auto_exposure_method,
+                "auto_exposure_ev": auto_ev,
+                "auto_exposure_scale": auto_scale,
+                "raw_after_autoexposure": scaled_raw,
+                "density_spectral_before_autoexposure": density_unscaled,
+                "exposure_compensation_ev": self.params.camera.exposure_compensation_ev,
+                "compensated_raw_before_autoexposure": compensated_raw_unscaled,
+                "compensated_raw_after_autoexposure": compensated_raw,
+                "density_spectral": density_spectral,
+                "compensated_density_spectral": compensated_density,
+            },
+            "print_calibration": {
+                "illuminant_name": self.params.enlarger.illuminant,
+                "wavelengths_nm": wavelengths_nm,
+                "filter_values": {
+                    "c": self.params.enlarger.c_filter_neutral,
+                    "m": self.params.enlarger.m_filter_neutral,
+                    "y": self.params.enlarger.y_filter_neutral,
+                    "m_shift": self.params.enlarger.m_filter_shift,
+                    "y_shift": self.params.enlarger.y_filter_shift,
+                },
+                "source_illuminant": crate::enlarger::standard_illuminant_f64(&self.params.enlarger.illuminant),
+                "filtered_illuminant": self.print_illuminant,
+                "print_sensitivity": sensitivity,
+                "film_channel_density": self.film.data.channel_density,
+                "film_base_density": self.film.data.base_density,
+                "raw_midgray_by_channel": channel_raw(&density_spectral),
+                "raw_compensated_midgray_by_channel": channel_raw(&compensated_density),
+                "raw_midgray_before_autoexposure_by_channel": channel_raw(&density_unscaled),
+                "raw_compensated_midgray_before_autoexposure_by_channel": channel_raw(&compensated_density_unscaled),
+                "factor_midgray": factor_midgray,
+                "factor_midgray_comp": factor_midgray_comp,
+                "factor_midgray_before_autoexposure": factor_midgray,
+                "factor_midgray_comp_before_autoexposure": factor_midgray_comp,
+                "factor_midgray_after_autoexposure": factor_midgray_autoexposed,
+                "factor_midgray_comp_after_autoexposure": factor_midgray_comp_autoexposed,
+                "selected_exposure_factor": self.print_exposure_factor,
+                "normalize_print_exposure": self.params.enlarger.normalize_print_exposure,
+                "print_exposure_compensation": self.params.enlarger.print_exposure_compensation,
+                "print_exposure": self.params.enlarger.print_exposure,
+                "black_white_correction": color_ref.printing_exposure_correction,
+                "effective_print_multiplier": self.print_exposure_factor
+                    * self.params.enlarger.print_exposure as f64
+                    * color_ref.printing_exposure_correction,
+                "preflash_raw": self.preflash_raw,
+                "preflash_exposure": self.params.enlarger.preflash_exposure,
+                "use_enlarger_lut": self.params.settings.use_enlarger_lut,
+                "lut_resolution": self.params.settings.lut_resolution,
+                "diffusion_filter_active": self.params.enlarger.diffusion_filter.active,
+                "wavelength_count": self.print_illuminant.len(),
+                "non_finite_counts": {
+                    "source_illuminant": non_finite_count(&crate::enlarger::standard_illuminant_f64(&self.params.enlarger.illuminant)),
+                    "filtered_illuminant": non_finite_count(&self.print_illuminant),
+                    "print_sensitivity": sensitivity.iter().flatten().filter(|value| !value.is_finite()).count(),
+                    "film_channel_density": non_finite_count(&film_channel_density),
+                    "film_base_density": non_finite_count(&self.film.data.base_density),
+                },
+            },
+        })
     }
 
     /// Return a copy of this calibrated pipeline with updated runtime params.
@@ -151,7 +485,7 @@ impl Pipeline {
 
 impl Pipeline {
     /// Create pipeline without spectral LUT (simplified path).
-    pub fn new(film: Profile, print: Profile, params: RuntimeParams) -> Self {
+    pub fn new(film: Profile, print: Profile, mut params: RuntimeParams) -> Self {
         // B&W profiles must be resolved on every construction path —
         // an unresolved family would read development-time columns as
         // R/G/B channels.
@@ -161,9 +495,13 @@ impl Pipeline {
             .development_time
             .or(params.film_render.development_time);
         let mut film = crate::profile::resolve_for_render(film, film_development_time);
+        apply_dir_coupler_presets(&film, &mut params);
         apply_film_curve_chemistry(&mut film, &params.film_render.chemistry)
             .expect("film density-curve model must be evaluable for rendering");
-        let print = crate::profile::resolve_for_render(print, params.print_render.development_time);
+        let mut print =
+            crate::profile::resolve_for_render(print, params.print_render.development_time);
+        refresh_print_density_curves(&mut print)
+            .expect("print density-curve model must be evaluable for rendering");
         let print_illuminant = enlarger::enlarger_filtered_illuminant_f64(
             &params.enlarger.illuminant,
             params.enlarger.c_filter_neutral as f64,
@@ -205,7 +543,8 @@ impl Pipeline {
             .development_time
             .or(params.film_render.development_time);
         let mut film = crate::profile::resolve_for_render(film, film_development_time);
-        let print = crate::profile::resolve_for_render(print, params.print_render.development_time);
+        let mut print =
+            crate::profile::resolve_for_render(print, params.print_render.development_time);
 
         // Python parity: mirror `_apply_film_specifics` in
         // `spektrafilm/runtime/params_builder.py`. Python applies these
@@ -213,8 +552,10 @@ impl Pipeline {
         // so a fresh `RuntimeParams::default()` does NOT match what
         // Python uses. The DIR-coupler gammas in particular differ
         // between positive and negative films.
+        apply_dir_coupler_presets(&film, &mut params);
         apply_film_specific_params(&film, &mut params);
         apply_film_curve_chemistry(&mut film, &params.film_render.chemistry)?;
+        refresh_print_density_curves(&mut print)?;
 
         // Python parity: look up per-(print, illuminant, film) neutral filter values from
         // the JSON database — matches `apply_database_neutral_print_filters`. Defaults to
@@ -383,9 +724,18 @@ impl Pipeline {
             }
         };
 
-        // Compute midgray spectral density (gray card through full filming path)
+        // Match Python's calibration reference: meter the midgray film-raw
+        // patch, apply that auto-exposure scale, then develop it for print
+        // exposure normalization.
+        let midgray_raw_unexposed = midgray_raw(1.0);
+        let midgray_auto_scale = if params.camera.auto_exposure {
+            midgray_auto_exposure_scale(midgray_raw_unexposed, &params.camera.auto_exposure_method)
+        } else {
+            1.0
+        };
+        let midgray_raw_autoexposed = midgray_raw_unexposed.map(|value| value * midgray_auto_scale);
         let density_spectral_midgray =
-            enlarger::midgray_density_spectral_from_raw(midgray_raw(1.0), &film, &params);
+            enlarger::midgray_density_spectral_from_raw(midgray_raw_autoexposed, &film, &params);
 
         // Print sensitivity: Python `sensitivity = np.nan_to_num(10 ** log_sensitivity)` — f64 with NaN→0.
         let print_log_sens = print.log_sensitivity_f64();
@@ -422,11 +772,8 @@ impl Pipeline {
         // and four flag combinations of
         // `enlarger.normalize_print_exposure` × `enlarger.print_exposure_compensation`.
         //
-        // With both flags ON (defaults) and no EV compensation,
-        // Python returns `factor_midgray_comp == 1.0`. Rust used to
-        // unconditionally apply `factor_midgray` here, which biased
-        // the print exposure by ~3% on every render and was the root
-        // cause of the residual Python-parity drift in the print stage.
+        // Both factors are derived from the auto-exposed gray reference,
+        // matching Python's calibration path.
         let factor_midgray = enlarger::compute_exposure_factor(
             &density_spectral_midgray,
             &print_illuminant,
@@ -444,7 +791,8 @@ impl Pipeline {
             factor_midgray
         } else {
             // Python: `rgb_midgray_comp = rgb_midgray * 2 ** exposure_compensation_ev`.
-            let scale = 2.0f64.powf(params.camera.exposure_compensation_ev as f64);
+            let scale =
+                2.0f64.powf(params.camera.exposure_compensation_ev as f64) * midgray_auto_scale;
             let density_spectral_midgray_comp =
                 enlarger::midgray_density_spectral_from_raw(midgray_raw(scale), &film, &params);
             enlarger::compute_exposure_factor(
@@ -490,12 +838,36 @@ impl Pipeline {
     }
 
     pub fn process(&self, image: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
+        self.process_with_observer(image, backend, None)
+    }
+
+    pub fn process_with_diagnostics(
+        &self,
+        image: ImageBuf,
+        backend: &dyn ComputeBackend,
+        observer: &mut dyn FnMut(&str, &ImageBuf),
+    ) -> ImageBuf {
+        self.process_with_observer(image, backend, Some(observer))
+    }
+
+    fn process_with_observer(
+        &self,
+        image: ImageBuf,
+        backend: &dyn ComputeBackend,
+        mut observer: Option<&mut dyn FnMut(&str, &ImageBuf)>,
+    ) -> ImageBuf {
+        if let Some(callback) = observer.as_deref_mut() {
+            callback("input", &image);
+        }
         // Working-resolution rescale (io.upscale_factor) — mirrors Python's
         // ResizingService.crop_and_rescale. Done first so the whole pipeline
         // (and the diffusion-filter kernel size, which scales with the image)
         // runs at the chosen resolution. pixel_size_um is derived per-stage
         // from the image dims, so it follows automatically.
         let image = self.rescale_working(image);
+        if let Some(callback) = observer.as_deref_mut() {
+            callback("input_rescaled", &image);
+        }
 
         // Scanner B&W/slide exposure correction (no-op unless scanner
         // white/black correction is on for a slide or print scan). Computed
@@ -516,8 +888,10 @@ impl Pipeline {
         // implement the resident chain return `None` and fall through.
         // DIR parity requires the f64 CPU implementation. The resident
         // chain uses f32 kernels, so bypass it whenever DIR is active.
-        if (self.tc_lut.is_some() || self.mallett_core.is_some())
+        if observer.is_none()
+            && (self.tc_lut.is_some() || self.mallett_core.is_some())
             && !self.params.film_render.dir_couplers.active
+            && !self.halation_requires_cpu()
         {
             if let Some(out) = self.try_gpu_resident(&image, backend, &color_ref) {
                 if backend.resident_chain_applies_post_scan() {
@@ -527,6 +901,13 @@ impl Pipeline {
             }
         }
 
+        let grain = &self.params.film_render.grain;
+        let grain_heavy = grain.active
+            && !self.params.debug.deactivate_stochastic_effects
+            && (grain.model.eq_ignore_ascii_case("monte_carlo")
+                || grain.model.eq_ignore_ascii_case("synthesis"));
+        let (expose_end, develop_end) = if grain_heavy { (5.0, 90.0) } else { (30.0, 60.0) };
+        spektrafilm_math::progress::report(1.0, "Exposing film");
         let log_raw = stages::filming::expose(
             &image,
             &self.film,
@@ -537,37 +918,78 @@ impl Pipeline {
             select_illuminant(&self.front_illuminant),
             color_ref.filming_exposure_correction,
         );
-        let filmed = stages::filming::develop(&log_raw, &self.film, &self.params, backend);
+        if let Some(callback) = observer.as_deref_mut() {
+            callback("filming_log_exposure", &log_raw);
+        }
+        let filmed = {
+            spektrafilm_math::progress::report(expose_end, "Developing film");
+            spektrafilm_math::progress::set_span(expose_end, develop_end);
+            stages::filming::develop(&log_raw, &self.film, &self.params, backend)
+        };
+        spektrafilm_math::progress::report(develop_end, "Printing and scanning");
+        if let Some(callback) = observer.as_deref_mut() {
+            callback("filming_density", &filmed);
+        }
 
         if self.params.io.scan_film {
-            stages::scanning::process(
+            let output = stages::scanning::process(
                 &filmed,
                 &self.film,
                 &self.params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
-            )
-        } else {
-            let printed = stages::printing::process_with_calibration(
-                &filmed,
-                &self.film,
-                &self.print,
-                &self.params,
-                backend,
-                &self.print_illuminant,
-                self.print_exposure_factor,
-                self.preflash_raw,
-                color_ref.printing_exposure_correction,
             );
-            stages::scanning::process(
+            if let Some(callback) = observer.as_deref_mut() {
+                callback("scan_output_encoded", &output);
+            }
+            output
+        } else {
+            let log_print = if let Some(callback) = observer.as_deref_mut() {
+                stages::printing::expose_calibrated_with_diagnostics(
+                    &filmed,
+                    &self.film,
+                    &self.print,
+                    &self.params,
+                    backend,
+                    &self.print_illuminant,
+                    self.print_exposure_factor,
+                    self.preflash_raw,
+                    color_ref.printing_exposure_correction,
+                    callback,
+                )
+            } else {
+                stages::printing::expose_calibrated(
+                    &filmed,
+                    &self.film,
+                    &self.print,
+                    &self.params,
+                    backend,
+                    &self.print_illuminant,
+                    self.print_exposure_factor,
+                    self.preflash_raw,
+                    color_ref.printing_exposure_correction,
+                )
+            };
+            if let Some(callback) = observer.as_deref_mut() {
+                callback("printing_log_exposure", &log_print);
+            }
+            let printed = stages::printing::develop(&log_print, &self.print, &self.params, backend);
+            if let Some(callback) = observer.as_deref_mut() {
+                callback("printing_density", &printed);
+            }
+            let output = stages::scanning::process(
                 &printed,
                 &self.print,
                 &self.params,
                 backend,
                 &color_ref,
                 &self.output_gamut,
-            )
+            );
+            if let Some(callback) = observer.as_deref_mut() {
+                callback("scan_output_encoded", &output);
+            }
+            output
         }
     }
 
@@ -582,6 +1004,7 @@ impl Pipeline {
     ) -> Option<ImageBuf> {
         if (self.tc_lut.is_none() && self.mallett_core.is_none())
             || self.params.film_render.dir_couplers.active
+            || self.halation_requires_cpu()
         {
             return None;
         }

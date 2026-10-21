@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
+use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
+use spektrafilm_math::precision::{to_f64, Scalar};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +54,9 @@ enum Commands {
         /// Default: 1 (no repetition).
         #[arg(long, default_value = "1")]
         iters: usize,
+        /// Log input, per-stage, and output statistics for parity diagnostics.
+        #[arg(long)]
+        diagnostics: bool,
         /// Path to the data directory.
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
@@ -83,6 +88,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    spektrafilm_math::progress::enable();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -103,6 +109,7 @@ fn main() -> Result<()> {
             params: params_file,
             raw_out,
             iters,
+            diagnostics,
             data_dir,
         } => {
             cmd_process(
@@ -115,6 +122,7 @@ fn main() -> Result<()> {
                 params_file.as_deref(),
                 raw_out.as_deref(),
                 iters,
+                diagnostics,
                 &data_dir,
             )?;
         }
@@ -146,8 +154,12 @@ fn cmd_process(
     params_file: Option<&Path>,
     raw_out: Option<&Path>,
     iters: usize,
+    diagnostics: bool,
     data_dir: &Path,
 ) -> Result<()> {
+    if diagnostics && iters > 1 {
+        bail!("--diagnostics cannot be combined with --iters greater than 1");
+    }
     let total_start = Instant::now();
 
     // Load profiles
@@ -240,7 +252,11 @@ fn cmd_process(
     );
 
     // Select backend
-    let backend = spektrafilm_gpu::select_backend();
+    let backend: Box<dyn ComputeBackend> = if diagnostics {
+        Box::new(spektrafilm_gpu::cpu_backend::CpuBackend)
+    } else {
+        spektrafilm_gpu::select_backend()
+    };
     eprintln!("Backend: {}", backend.name());
 
     // Run pipeline (with full Hanatos2025 spectral upsampling)
@@ -260,7 +276,13 @@ fn cmd_process(
             },
         )
     });
-    let result = if iters > 1 {
+    let result = if diagnostics {
+        print_calibration_statistics(pipeline.diagnostics_calibration());
+        let mut observer = |stage: &str, image: &ImageBuf| {
+            print_stage_statistics(stage, image);
+        };
+        pipeline.process_with_diagnostics(image, backend.as_ref(), &mut observer)
+    } else if iters > 1 {
         // Warm-cache bench: process the image `iters` times in the same backend
         // instance. The first iteration pays shader-compile cost; subsequent ones
         // hit the cache and reflect "GUI live preview" performance.
@@ -310,6 +332,100 @@ fn cmd_process(
     }
 
     Ok(())
+}
+
+fn print_stage_statistics(stage: &str, image: &ImageBuf) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    let mut channel_sum = [0.0; 3];
+    let mut channel_count = [0usize; 3];
+    let mut invalid_count = 0usize;
+    let stride = (image.data.len() / 1_000_000).max(1);
+    let mut sample = Vec::with_capacity(image.data.len().min(1_000_000));
+
+    for (index, scalar) in image.data.iter().enumerate() {
+        let value = to_f64(*scalar);
+        if !value.is_finite() {
+            invalid_count += 1;
+            continue;
+        }
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+        let channel = index % 3;
+        channel_sum[channel] += value;
+        channel_count[channel] += 1;
+        if index % stride == 0 {
+            sample.push(value);
+        }
+    }
+
+    sample.sort_by(f64::total_cmp);
+    let percentile = |q: f64| -> Option<f64> {
+        if sample.is_empty() {
+            return None;
+        }
+        let index = q * (sample.len() - 1) as f64;
+        let low = index.floor() as usize;
+        let high = index.ceil() as usize;
+        Some(sample[low] + (sample[high] - sample[low]) * (index - low as f64))
+    };
+    let count = image.data.len() - invalid_count;
+    let mean = (count > 0).then_some(sum / count as f64);
+    let channel_mean: Vec<Option<f64>> = (0..3)
+        .map(|channel| {
+            (channel_count[channel] > 0)
+                .then_some(channel_sum[channel] / channel_count[channel] as f64)
+        })
+        .collect();
+    let min = (count > 0).then_some(min);
+    let max = (count > 0).then_some(max);
+    let dtype = if std::mem::size_of::<Scalar>() == 8 {
+        "float64"
+    } else {
+        "float32"
+    };
+    let record = serde_json::json!({
+        "stage": stage,
+        "shape": [image.height, image.width, 3],
+        "dtype": dtype,
+        "min": min,
+        "max": max,
+        "mean": mean,
+        "p01_sampled": percentile(0.01),
+        "p99_sampled": percentile(0.99),
+        "channel_mean": channel_mean,
+        "invalid_count": invalid_count,
+        "samples": stage_samples(image),
+    });
+    eprintln!("SCAN_STAGE_STATS {record}");
+}
+
+fn stage_samples(image: &ImageBuf) -> Vec<serde_json::Value> {
+    let fractions = [0.0, 0.25, 0.5, 0.75, 1.0];
+    let mut coordinates = Vec::new();
+    for &y_fraction in &fractions {
+        for &x_fraction in &fractions {
+            let x = ((image.width.saturating_sub(1)) as f64 * x_fraction).round() as u32;
+            let y = ((image.height.saturating_sub(1)) as f64 * y_fraction).round() as u32;
+            if !coordinates.contains(&(x, y)) {
+                coordinates.push((x, y));
+            }
+        }
+    }
+    coordinates.sort_by_key(|&(x, y)| (y, x));
+    coordinates
+        .into_iter()
+        .map(|(x, y)| {
+            let rgb = image.get(x, y).map(to_f64);
+            serde_json::json!({"x": x, "y": y, "rgb": rgb})
+        })
+        .collect()
+}
+
+fn print_calibration_statistics(calibration: serde_json::Value) {
+    eprintln!("SCAN_CALIBRATION {calibration}");
 }
 
 fn bytemuck_cast_f64_to_bytes(v: &[f64]) -> &[u8] {

@@ -14,17 +14,31 @@ use rayon::prelude::*;
 /// independently avoids the 3x-redundant work of blurring a 3-channel
 /// ImageBuf where all channels are identical.
 pub fn gaussian_blur_channel(data: &[Scalar], w: u32, h: u32, sigma: f32) -> Vec<Scalar> {
+    gaussian_blur_channel_with_sigma(data, w, h, from_f32(sigma))
+}
+
+/// f64-sigma variant for physical filters whose widths are stored in f64.
+pub fn gaussian_blur_channel_f64(data: &[Scalar], w: u32, h: u32, sigma: f64) -> Vec<Scalar> {
+    gaussian_blur_channel_with_sigma(data, w, h, from_f64(sigma))
+}
+
+fn gaussian_blur_channel_with_sigma(
+    data: &[Scalar],
+    w: u32,
+    h: u32,
+    sigma_s: Scalar,
+) -> Vec<Scalar> {
     let wu = w as usize;
     let hu = h as usize;
     assert_eq!(data.len(), wu * hu);
-    if sigma <= 0.0 {
+    if sigma_s <= ZERO {
         return data.to_vec();
     }
-    let sigma_s = from_f32(sigma);
     let mut chan = data.to_vec();
     let mut tmp = vec![ZERO; wu * hu];
-    blur_1d_parallel(&chan, &mut tmp, wu, hu, sigma_s, true);
-    blur_1d_parallel(&tmp, &mut chan, wu, hu, sigma_s, false);
+    // Match scipy.ndimage's fused FIR order used by Python's filter helpers.
+    blur_1d_parallel(&chan, &mut tmp, wu, hu, sigma_s, false);
+    blur_1d_parallel(&tmp, &mut chan, wu, hu, sigma_s, true);
     chan
 }
 
@@ -40,14 +54,32 @@ pub fn exponential_filter_channel(
     h: u32,
     decay_constant: f32,
 ) -> Vec<Scalar> {
+    exponential_filter_channel_with_decay(data, w, h, from_f32(decay_constant))
+}
+
+/// f64-decay variant for physical filters whose widths are stored in f64.
+pub fn exponential_filter_channel_f64(
+    data: &[Scalar],
+    w: u32,
+    h: u32,
+    decay_constant: f64,
+) -> Vec<Scalar> {
+    exponential_filter_channel_with_decay(data, w, h, from_f64(decay_constant))
+}
+
+fn exponential_filter_channel_with_decay(
+    data: &[Scalar],
+    w: u32,
+    h: u32,
+    decay_s: Scalar,
+) -> Vec<Scalar> {
     // Python `_EXPONENTIAL_GAUSSIAN_FITS[3]` — amplitude, σ / decay.
     const FIT: [(f64, f64); 3] = [(0.1633, 0.5360), (0.6496, 1.5236), (0.1870, 2.7684)];
     let n = data.len();
     let mut result = vec![ZERO; n];
-    let decay_f64 = decay_constant as f64;
     for &(amp, ratio) in &FIT {
-        let sigma_k = (ratio * decay_f64) as f32;
-        let component = gaussian_blur_channel(data, w, h, sigma_k);
+        let sigma_k = from_f64(ratio) * decay_s;
+        let component = gaussian_blur_channel_with_sigma(data, w, h, sigma_k);
         let amp_s = from_f64(amp);
         for (r, &v) in result.iter_mut().zip(component.iter()) {
             *r += amp_s * v;
@@ -130,9 +162,7 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sx = (x as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(w as isize - 1) as usize;
+                        let sx = reflect_index(x as isize + ki as isize - radius as isize, w);
                         sum += row_src[sx] * kv;
                     }
                     row_dst[x] = sum;
@@ -145,14 +175,24 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sy = (y as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(h as isize - 1) as usize;
+                        let sy = reflect_index(y as isize + ki as isize - radius as isize, h);
                         sum += src[sy * w + x] * kv;
                     }
                     row_dst[x] = sum;
                 }
             });
+    }
+}
+
+/// Half-sample symmetric reflection, matching SciPy's `mode="reflect"`.
+fn reflect_index(index: isize, len: usize) -> usize {
+    debug_assert!(len > 0);
+    let period = 2 * len as isize;
+    let folded = index.rem_euclid(period);
+    if folded < len as isize {
+        folded as usize
+    } else {
+        (period - 1 - folded) as usize
     }
 }
 
@@ -315,6 +355,25 @@ mod tests {
         let out = gaussian_blur(&img, 2.0);
         for (a, b) in img.data.iter().zip(out.data.iter()) {
             assert!((a - b).abs() < from_f64(1e-4), "expected {a}, got {b}");
+        }
+    }
+
+    #[test]
+    fn reflect_index_matches_half_sample_symmetric_edges() {
+        let expected = [2, 1, 0, 0, 1, 2, 2, 1, 0];
+        for (index, expected) in (-3..6).zip(expected) {
+            assert_eq!(reflect_index(index, 3), expected);
+        }
+        assert_eq!(reflect_index(-100, 1), 0);
+        assert_eq!(reflect_index(100, 1), 0);
+    }
+
+    #[test]
+    fn gaussian_channel_f64_sigma_preserves_constant_signal() {
+        let input = vec![from_f64(0.42); 5 * 3];
+        let output = gaussian_blur_channel_f64(&input, 5, 3, 0.1234567890123);
+        for value in output {
+            assert!((value - from_f64(0.42)).abs() < from_f64(1e-6));
         }
     }
 }

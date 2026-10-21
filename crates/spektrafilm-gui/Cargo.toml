@@ -9,6 +9,7 @@ name = "spektrafilm-gui"
 path = "src/main.rs"
 
 [features]
+default = ["precision-f64"]
 precision-f64 = [
     "spektrafilm-math/precision-f64",
     "spektrafilm-core/precision-f64",

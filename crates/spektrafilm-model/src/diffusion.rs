@@ -53,7 +53,7 @@ pub fn apply_gaussian_blur_um(
 #[allow(clippy::too_many_arguments)]
 pub fn apply_halation_um(
     raw: &ImageBuf,
-    pixel_size_um: f32,
+    pixel_size_um: f64,
     scatter_amount: f64,
     scatter_spatial_scale: f64,
     scatter_core_um: [f64; 3],
@@ -82,7 +82,7 @@ pub fn apply_halation_um(
     //   * tail weight is per-channel.
     // i.e. every place Python takes a length-3 array, we treat it as a
     // length-3 array, not as `(sum / 3.0)`.
-    use spektrafilm_math::gaussian::{exponential_filter_channel, gaussian_blur_channel};
+    use spektrafilm_math::gaussian::{exponential_filter_channel_f64, gaussian_blur_channel_f64};
 
     let w = raw.width;
     let h = raw.height;
@@ -96,7 +96,7 @@ pub fn apply_halation_um(
     // 1. Scatter pass — per-channel core gaussian + tail exponential.
     // f64 sigmas/lambdas — Python casts these via
     // `np.asarray(..., dtype=np.float64) * s_scale / pixel_size_um`.
-    let pix_um_f64 = pixel_size_um as f64;
+    let pix_um_f64 = pixel_size_um;
     if scatter_amount > 0.0 {
         for c in 0..3 {
             let sigma_c_px_f64 = scatter_core_um[c] * scatter_spatial_scale / pix_um_f64;
@@ -104,13 +104,10 @@ pub fn apply_halation_um(
             if sigma_c_px_f64 <= 0.0 && lambda_t_px_f64 <= 0.0 {
                 continue;
             }
-            // gaussian_blur/exponential_filter take f32 sigma — narrow at the
-            // boundary (the kernel itself produces the same bits for any
-            // f32-representable sigma, this is just so we don't break the API).
-            let sigma_c_px = sigma_c_px_f64.max(1e-6) as f32;
-            let lambda_t_px = lambda_t_px_f64.max(1e-6) as f32;
-            let core = gaussian_blur_channel(&channels[c], w, h, sigma_c_px);
-            let tail = exponential_filter_channel(&channels[c], w, h, lambda_t_px);
+            let sigma_c_px = sigma_c_px_f64.max(1e-6);
+            let lambda_t_px = lambda_t_px_f64.max(1e-6);
+            let core = gaussian_blur_channel_f64(&channels[c], w, h, sigma_c_px);
+            let tail = exponential_filter_channel_f64(&channels[c], w, h, lambda_t_px);
             let one = from_f64(1.0);
             let wt = from_f64(scatter_tail_weight[c]);
             let sa = from_f64(scatter_amount);
@@ -152,8 +149,8 @@ pub fn apply_halation_um(
             }
             let mut hb = vec![ZERO; n_pix];
             for (k, &wk) in decay.iter().enumerate() {
-                let sigma_k = (sigma_first_px_f64 * ((k as f64) + 1.0).sqrt()).max(1e-6) as f32;
-                let blurred = gaussian_blur_channel(&channels[c], w, h, sigma_k);
+                let sigma_k = (sigma_first_px_f64 * ((k as f64) + 1.0).sqrt()).max(1e-6);
+                let blurred = gaussian_blur_channel_f64(&channels[c], w, h, sigma_k);
                 let wk_s = from_f64(wk);
                 for i in 0..n_pix {
                     hb[i] += wk_s * blurred[i];
@@ -182,6 +179,47 @@ pub fn apply_halation_um(
         out.write_channel(c, &channels[c]);
     }
     out
+}
+
+#[cfg(test)]
+mod halation_tests {
+    use super::apply_halation_um;
+    use spektrafilm_gpu::cpu_backend::CpuBackend;
+    use spektrafilm_math::image::ImageBuf;
+    use spektrafilm_math::precision::{from_f64, to_f64};
+
+    #[test]
+    fn halation_uses_channel_specific_f64_sigmas() {
+        let mut input = ImageBuf::new(9, 9);
+        input.set(4, 4, [from_f64(1.0); 3]);
+        let output = apply_halation_um(
+            &input,
+            1.0,
+            0.0,
+            1.0,
+            [0.5; 3],
+            [1.0; 3],
+            [0.5; 3],
+            1.0,
+            1.0,
+            [1.0; 3],
+            [0.5, 1.0, 2.0],
+            1,
+            1.0,
+            false,
+            &CpuBackend,
+        );
+        let center = [0, 1, 2].map(|channel| to_f64(output.get(4, 4)[channel]));
+        let adjacent = [0, 1, 2].map(|channel| to_f64(output.get(5, 4)[channel]));
+        assert!(
+            center[0] > center[2],
+            "center response should vary by sigma: {center:?}"
+        );
+        assert!(
+            (adjacent[0] - adjacent[2]).abs() > 1e-3,
+            "off-center response should vary by sigma: {adjacent:?}"
+        );
+    }
 }
 
 // ===========================================================================

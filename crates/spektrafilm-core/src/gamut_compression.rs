@@ -10,9 +10,8 @@
 //! lightness. A one-sided lightness compression first rolls super-bright
 //! highlights (`L > white`) back into range.
 //!
-//! Ported for sRGB: `oklch`, `oklrab`, `cam16ucs`, and `aces_rgc`
-//! (per-channel). CAM16-UCS also supports native ProPhoto/D50 output.
-//! `jzazbz` remains a follow-up.
+//! `oklch`, `oklrab`, and `cam16ucs` use target-gamut tables for sRGB and
+//! ProPhoto RGB; `aces_rgc` is per-channel. `jzazbz` remains a follow-up.
 //! Gated behind
 //! `io.output_gamut_compress` (default off → no change).
 
@@ -44,17 +43,6 @@ const PROPHOTO_RGB_TO_XYZ: [[f64; 3]; 3] = [
 ];
 const PROPHOTO_WHITE_XYZ: [f64; 3] = [0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585];
 const XYZ_TO_PROPHOTO_RGB: [[f64; 3]; 3] = spektrafilm_math::colorspace::XYZ_TO_PROPHOTO_F64;
-const D50_TO_D65: [[f64; 3]; 3] = [
-    [0.9554734, -0.0230985, 0.0632593],
-    [-0.0283697, 1.0099955, 0.0210414],
-    [0.0123140, -0.0205077, 1.3303659],
-];
-const D65_TO_D50: [[f64; 3]; 3] = [
-    [1.0479298, 0.0229468, -0.0501922],
-    [0.0296278, 0.9904345, -0.0170738],
-    [-0.0092431, 0.0150552, 0.7518743],
-];
-
 // OkLab (Ottosson) matrices, exactly as colour-science stores them.
 const M1_XYZ_TO_LMS: [[f64; 3]; 3] = [
     [0.8189330101, 0.3618667424, -0.1288597137],
@@ -157,17 +145,22 @@ enum Space {
     Oklch,
     /// OkLab with the Ottosson Lr-rebased lightness on the L axis.
     Oklrab,
+    OklchProPhoto,
+    OklrabProPhoto,
     Cam16ucs,
     Cam16ucsProPhoto,
 }
 
 impl Space {
-    /// linear sRGB → perceptual reconstruction coords `[L, a, b]`.
+    /// Linear RGB in the space's target gamut → perceptual coords `[L, a, b]`.
     #[inline]
     fn from_rgb(self, rgb: [f64; 3]) -> [f64; 3] {
         match self {
             // oklrab shares OkLab coords; only the C_max lookup index differs.
             Space::Oklch | Space::Oklrab => xyz_to_oklab(mat_vec(&SRGB_RGB_TO_XYZ, rgb)),
+            Space::OklchProPhoto | Space::OklrabProPhoto => {
+                xyz_to_oklab(mat_vec(&PROPHOTO_RGB_TO_XYZ, rgb))
+            }
             Space::Cam16ucs => xyz_to_cam16ucs(mat_vec(&SRGB_RGB_TO_XYZ, rgb)),
             Space::Cam16ucsProPhoto => {
                 let xyz = mat_vec(&PROPHOTO_RGB_TO_XYZ, rgb);
@@ -175,11 +168,14 @@ impl Space {
             }
         }
     }
-    /// perceptual reconstruction coords `[L, a, b]` → linear sRGB.
+    /// Perceptual coords `[L, a, b]` → linear RGB in the target gamut.
     #[inline]
     fn to_rgb(self, lab: [f64; 3]) -> [f64; 3] {
         let xyz = match self {
             Space::Oklch | Space::Oklrab => oklab_to_xyz(lab),
+            Space::OklchProPhoto | Space::OklrabProPhoto => {
+                return mat_vec(&XYZ_TO_PROPHOTO_RGB, oklab_to_xyz(lab));
+            }
             Space::Cam16ucs => cam16ucs_to_xyz(lab),
             Space::Cam16ucsProPhoto => {
                 let xyz = cam16ucs_to_xyz_with(lab, cam16_prophoto_params());
@@ -193,7 +189,7 @@ impl Space {
     #[inline]
     fn lookup_lightness(self, l: f64) -> f64 {
         match self {
-            Space::Oklrab => oklab_l_to_lr(l),
+            Space::Oklrab | Space::OklrabProPhoto => oklab_l_to_lr(l),
             _ => l,
         }
     }
@@ -201,7 +197,7 @@ impl Space {
     #[inline]
     fn recon_lightness(self, lookup: f64) -> f64 {
         match self {
-            Space::Oklrab => oklrab_lr_to_l(lookup),
+            Space::Oklrab | Space::OklrabProPhoto => oklrab_lr_to_l(lookup),
             _ => lookup,
         }
     }
@@ -211,7 +207,9 @@ impl Space {
     /// space alone.
     fn table_geometry(self) -> (f64, f64, f64) {
         match self {
-            Space::Oklch | Space::Oklrab => (0.02, 1.0, 0.5),
+            Space::Oklch | Space::Oklrab | Space::OklchProPhoto | Space::OklrabProPhoto => {
+                (0.02, 1.0, 0.5)
+            }
             Space::Cam16ucs | Space::Cam16ucsProPhoto => (1.0, 110.0, 150.0),
         }
     }
@@ -267,11 +265,9 @@ impl OutputGamutCompress {
     }
 
     /// Build from params for the given output color space. `off` is a silent
-    /// identity; perceptual algorithms build their target-gamut `C_max` table. An
-    /// unported-but-valid algorithm (`jzazbz`/`oklrab`/`aces_rgc`), an unknown
-    /// algorithm, or a non-sRGB output all log an error and fall back to
-    /// identity (so colors pass through uncompressed rather than silently
-    /// appearing to be handled).
+    /// identity; perceptual algorithms build their target-gamut `C_max` table.
+    /// Unsupported algorithms, output spaces other than sRGB/ProPhoto RGB, or
+    /// unknown algorithms log an error and fall back to identity.
     pub fn build(params: &OutputGamutCompressParams, output_color_space: &str) -> Self {
         let knee = (
             params.knee[0] as f64,
@@ -301,8 +297,8 @@ impl OutputGamutCompress {
             "cam16ucs" if output_color_space == "sRGB" => Space::Cam16ucs,
             "oklch" | "oklrab" | "cam16ucs" if output_color_space == "ProPhoto RGB" => {
                 match params.algorithm.as_str() {
-                    "oklch" => Space::Oklch,
-                    "oklrab" => Space::Oklrab,
+                    "oklch" => Space::OklchProPhoto,
+                    "oklrab" => Space::OklrabProPhoto,
                     _ => Space::Cam16ucsProPhoto,
                 }
             }
@@ -310,7 +306,7 @@ impl OutputGamutCompress {
                 tracing::error!(
                     algorithm = algo,
                     output = output_color_space,
-                    "output gamut compression: only sRGB output is supported; disabling"
+                    "output gamut compression: only sRGB and ProPhoto RGB outputs are supported; disabling"
                 );
                 return Self::identity();
             }
@@ -329,13 +325,11 @@ impl OutputGamutCompress {
                 return Self::identity();
             }
         };
-        // Perceptual white: OkLab white sits at L=1; CAM16-UCS Jp at the output
-        // white (~100 under the configured viewing conditions). The white is
-        // the exact D65 chromaticity (matching Python's `_output_cs_whitepoint_xyz`
-        // → `_xy_to_xyz_unit_y`), NOT the rounded sRGB matrix's column sums.
+        // Perceptual white: OkLab white sits at L=1; CAM16-UCS Jp is measured
+        // at the output white under the configured viewing conditions.
         let l_white = match space {
             // OkLab white sits at L=1, and Lr(1)=1, so both are 1.0.
-            Space::Oklch | Space::Oklrab => 1.0,
+            Space::Oklch | Space::Oklrab | Space::OklchProPhoto | Space::OklrabProPhoto => 1.0,
             Space::Cam16ucs => xyz_to_cam16ucs(SRGB_WHITE_XYZ)[0],
             Space::Cam16ucsProPhoto => {
                 xyz_to_cam16ucs_with(PROPHOTO_WHITE_XYZ, cam16_prophoto_params())[0]
@@ -368,6 +362,8 @@ impl OutputGamutCompress {
             Kind::AcesRgc => 0,
             Kind::Perceptual(Space::Oklch) => 1,
             Kind::Perceptual(Space::Oklrab) => 2,
+            Kind::Perceptual(Space::OklchProPhoto) => 1,
+            Kind::Perceptual(Space::OklrabProPhoto) => 2,
             Kind::Perceptual(Space::Cam16ucs) => 3,
             Kind::Perceptual(Space::Cam16ucsProPhoto) => 3,
         };
@@ -421,16 +417,7 @@ impl OutputGamutCompress {
             Kind::AcesRgc => return self.compress_aces_rgc(rgb),
             Kind::Perceptual(s) => s,
         };
-        let uses_srgb_working_gamut =
-            self.output_color_space == "ProPhoto RGB" && space != Space::Cam16ucsProPhoto;
-        let working_rgb = if uses_srgb_working_gamut {
-            let xyz_d50 = mat_vec(&PROPHOTO_RGB_TO_XYZ, rgb);
-            let xyz_d65 = mat_vec(&D50_TO_D65, xyz_d50);
-            mat_vec(&SRGB_XYZ_TO_RGB, xyz_d65)
-        } else {
-            rgb
-        };
-        let lab = space.from_rgb(working_rgb);
+        let lab = space.from_rgb(rgb);
         // One-sided lightness compression first (so C_max is looked up at the
         // corrected L), normalized by the perceptual white.
         let mut l = lab[0];
@@ -447,14 +434,7 @@ impl OutputGamutCompress {
         let safe = c_max.max(1e-9);
         let d_comp = reinhard_knee(c / safe, self.knee.0, self.knee.1, self.knee.2);
         let c_new = d_comp * safe;
-        let compressed_rgb = space.to_rgb([l, c_new * h.cos(), c_new * h.sin()]);
-        if uses_srgb_working_gamut {
-            let xyz_d65 = mat_vec(&SRGB_RGB_TO_XYZ, compressed_rgb);
-            let xyz_d50 = mat_vec(&D65_TO_D50, xyz_d65);
-            mat_vec(&XYZ_TO_PROPHOTO_RGB, xyz_d50)
-        } else {
-            compressed_rgb
-        }
+        space.to_rgb([l, c_new * h.cos(), c_new * h.sin()])
     }
 
     /// ACES Reference Gamut Compression v1.3: per-channel Reinhard knee on the
@@ -738,6 +718,8 @@ fn cmax_table_cached(space: Space) -> Arc<Vec<f64>> {
         Space::Oklrab => 1,
         Space::Cam16ucs => 2,
         Space::Cam16ucsProPhoto => 3,
+        Space::OklchProPhoto => 4,
+        Space::OklrabProPhoto => 5,
     };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(table) = cache.lock().unwrap().get(&key) {
@@ -806,6 +788,14 @@ mod tests {
 
     fn check_reference(algo: &str, cases: &[([f64; 3], [f64; 3])]) {
         let comp = build_for(algo);
+        check_compressor_reference(algo, &comp, cases);
+    }
+
+    fn check_compressor_reference(
+        algo: &str,
+        comp: &OutputGamutCompress,
+        cases: &[([f64; 3], [f64; 3])],
+    ) {
         for (rgb, want) in cases {
             let got = comp.compress(*rgb);
             for c in 0..3 {
@@ -820,6 +810,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn build_for_prophoto(algorithm: &str) -> OutputGamutCompress {
+        let params = OutputGamutCompressParams {
+            algorithm: algorithm.into(),
+            knee: [0.0, 1.0, 6.0],
+            lightness_compression: Some([0.7, 1.0, 2.2]),
+        };
+        OutputGamutCompress::build(&params, "ProPhoto RGB")
+    }
+
+    #[test]
+    fn prophoto_oklch_matches_python_reference() {
+        check_compressor_reference(
+            "ProPhoto oklch",
+            &build_for_prophoto("oklch"),
+            &[
+                (
+                    [0.5, 0.4, 0.3],
+                    [0.4985381706538354, 0.39874271720967963, 0.2989796528305229],
+                ),
+                (
+                    [1.4, 0.2, 0.1],
+                    [0.9963083364126335, 0.37365513926763877, 0.3208137542477491],
+                ),
+                (
+                    [0.1, 0.3, 1.2],
+                    [0.10350153873410428, 0.29397512666912284, 0.9548831145164554],
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn prophoto_oklrab_matches_python_reference() {
+        check_compressor_reference(
+            "ProPhoto oklrab",
+            &build_for_prophoto("oklrab"),
+            &[
+                (
+                    [0.5, 0.4, 0.3],
+                    [0.4985381695524968, 0.3987427178664791, 0.29897965595762577],
+                ),
+                (
+                    [1.4, 0.2, 0.1],
+                    [0.9963053115700281, 0.37365691201865087, 0.3208163672531871],
+                ),
+                (
+                    [0.1, 0.3, 1.2],
+                    [0.10350190199091726, 0.2939747497778835, 0.9548733005279845],
+                ),
+            ],
+        );
     }
 
     /// Regression guard: oklch reference rows from `compress_rgb_oklch_chroma`

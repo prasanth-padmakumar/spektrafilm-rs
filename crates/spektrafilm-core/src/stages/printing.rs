@@ -4,7 +4,6 @@
 use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::pchip3d::{PreparedPchip3d, pchip_interp, prepare_pchip_3d};
 use spektrafilm_math::precision::from_f64;
 
 use crate::params::RuntimeParams;
@@ -41,7 +40,7 @@ fn build_lut_grid(steps: usize, data_min: [f64; 3], data_max: [f64; 3]) -> Image
 }
 
 /// Run `print_spectral` on a `steps³` grid of CMY inputs spanning
-/// `[data_min, data_max]` per channel, then PCHIP-interpolate the
+/// `[data_min, data_max]` per channel, then tetrahedrally interpolate the
 /// full image against that LUT. Bit-parity with Python's
 /// `_lut_service.spectral_compute_enlarger(use_lut=True)` path.
 #[allow(clippy::too_many_arguments)]
@@ -69,43 +68,9 @@ fn print_spectral_via_lut(
         preflash,
     );
     // Convert Scalar storage to f64 — no-op cast in precision-f64 mode,
-    // a widening in f32 mode. The PCHIP slopes are computed in f64
-    // regardless to match Python's f64 LUT type.
+    // a widening in f32 mode. Python's LUT helper stores f64 values.
     let lut_f64: Vec<f64> = lut_image.data.iter().map(|&v| v as f64).collect();
-    let prepared = prepare_pchip_3d(lut_f64, steps);
-    apply_pchip_lut(cmy_film, &prepared, data_min, data_max)
-}
-
-/// Apply a prepared PCHIP LUT to every pixel. Mirrors Python's
-/// `compute_with_lut` normalisation (`(x - xmin) / (xmax - xmin)`)
-/// followed by `_apply_lut_pchip_3d_prepared` (which multiplies by
-/// `size - 1` and interpolates). Rayon-parallel per pixel.
-fn apply_pchip_lut(
-    image: &ImageBuf,
-    prepared: &PreparedPchip3d,
-    data_min: [f64; 3],
-    data_max: [f64; 3],
-) -> ImageBuf {
-    let scale = (prepared.size - 1) as f64;
-    let inv = [
-        scale / (data_max[0] - data_min[0]),
-        scale / (data_max[1] - data_min[1]),
-        scale / (data_max[2] - data_min[2]),
-    ];
-    let mut out = image.clone();
-    out.data
-        .par_chunks_exact_mut(3)
-        .zip(image.data.par_chunks_exact(3))
-        .for_each(|(dst, src)| {
-            let r = (src[0] as f64 - data_min[0]) * inv[0];
-            let g = (src[1] as f64 - data_min[1]) * inv[1];
-            let b = (src[2] as f64 - data_min[2]) * inv[2];
-            let v = pchip_interp(prepared, r, g, b);
-            dst[0] = from_f64(v[0]);
-            dst[1] = from_f64(v[1]);
-            dst[2] = from_f64(v[2]);
-        });
-    out
+    spektrafilm_math::lut::apply_tetrahedral_3d_f64(cmy_film, &lut_f64, steps, data_min, data_max)
 }
 
 /// Bounds for the enlarger LUT: `data_min = -grain.density_min` and
@@ -161,6 +126,60 @@ pub fn expose_calibrated(
     preflash: [f64; 3],
     bw_print_correction: f64,
 ) -> ImageBuf {
+    expose_calibrated_impl(
+        cmy_film,
+        film,
+        print,
+        params,
+        backend,
+        print_illuminant,
+        exposure_factor,
+        preflash,
+        bw_print_correction,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn expose_calibrated_with_diagnostics(
+    cmy_film: &ImageBuf,
+    film: &Profile,
+    print: &Profile,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    print_illuminant: &[f64],
+    exposure_factor: f64,
+    preflash: [f64; 3],
+    bw_print_correction: f64,
+    observer: &mut dyn FnMut(&str, &ImageBuf),
+) -> ImageBuf {
+    expose_calibrated_impl(
+        cmy_film,
+        film,
+        print,
+        params,
+        backend,
+        print_illuminant,
+        exposure_factor,
+        preflash,
+        bw_print_correction,
+        Some(observer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expose_calibrated_impl(
+    cmy_film: &ImageBuf,
+    film: &Profile,
+    print: &Profile,
+    params: &RuntimeParams,
+    backend: &dyn ComputeBackend,
+    print_illuminant: &[f64],
+    exposure_factor: f64,
+    preflash: [f64; 3],
+    bw_print_correction: f64,
+    mut observer: Option<&mut dyn FnMut(&str, &ImageBuf)>,
+) -> ImageBuf {
     // Python parity — `channel_density` and `base_density` are f64 in the profile JSON.
     let channel_density: Vec<[f64; 3]> = film
         .data
@@ -195,7 +214,7 @@ pub fn expose_calibrated(
     //
     // If `use_enlarger_lut` is set, evaluate the spectral function on
     // a `lut_resolution³` grid of cmy values (4913 nodes at the
-    // default resolution=17) and PCHIP-interpolate per pixel.
+    // default resolution=17) and tetrahedrally interpolate per pixel.
     // Matches Python's `_lut_service.spectral_compute_enlarger`.
     let mut log_raw_print = if params.settings.use_enlarger_lut {
         let (data_min, data_max) = enlarger_lut_bounds(film, params);
@@ -223,6 +242,24 @@ pub fn expose_calibrated(
             preflash,
         )
     };
+    macro_rules! report_linear_stage {
+        ($stage:expr, $scale:expr) => {
+            if let Some(callback) = observer.as_deref_mut() {
+                let scale = $scale;
+                let data = log_raw_print
+                    .data
+                    .iter()
+                    .map(|&value| {
+                        let raw = 10.0f64.powf(value as f64) * scale;
+                        spektrafilm_math::precision::from_f64(raw)
+                    })
+                    .collect();
+                let image = ImageBuf::from_data(log_raw_print.width, log_raw_print.height, data);
+                callback($stage, &image);
+            }
+        };
+    }
+    report_linear_stage!("printing_raw_after_midgray_preflash", 1.0);
 
     // Stage 2: 10^log_raw_print, scale by print_exposure × bw, then
     // the outer log10. With print_exposure=1 and bw=1 the operations
@@ -241,6 +278,11 @@ pub fn expose_calibrated(
     // in-place multiply after print_exposure, so we keep the two multiplies
     // separate (left-to-right) rather than pre-combining the scalars. 1.0 = no-op.
     let bw = bw_print_correction;
+    report_linear_stage!("printing_raw_after_print_exposure", print_exposure);
+    report_linear_stage!(
+        "printing_raw_after_black_white_correction",
+        print_exposure * bw
+    );
 
     // Enlarger diffusion filter operates on the *linear* print raw (Python:
     // raw = 10^log_raw_print * print_exposure * bw; raw = diffusion(raw); log10).
@@ -272,6 +314,9 @@ pub fn expose_calibrated(
         } else {
             spektrafilm_model::diffusion::apply_diffusion_filter_um(&lin, &dm, pix_um as f64)
         };
+        if let Some(callback) = observer.as_deref_mut() {
+            callback("printing_raw_after_diffusion", &lin);
+        }
         lin.data.par_iter_mut().for_each(|v| {
             let x = *v as f64;
             *v = spektrafilm_math::precision::from_f64((x.max(0.0) + 1e-10).log10());
@@ -279,6 +324,7 @@ pub fn expose_calibrated(
         return lin;
     }
 
+    report_linear_stage!("printing_raw_after_diffusion", print_exposure * bw);
     log_raw_print.data.par_chunks_mut(BLOCK).for_each(|chunk| {
         let mut tmp: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
         spektrafilm_math::vforce::exp10_inplace(&mut tmp);
